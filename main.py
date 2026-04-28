@@ -33,9 +33,9 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 @app.get("/info")
-def info() -> dict[str, str]:
+def info() -> list[str]:
     """Return information about the items."""
-    return list(map(lambda x: f"Item {x.name}: {x.description}", _items))
+    return [f"Item {item.name}: {item.description}" for item in _items]
 
 @app.get("/items", response_model=list[Item])
 def list_items() -> list[Item]:
