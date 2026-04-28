@@ -30,7 +30,7 @@ def read_root() -> dict[str, str]:
 @app.get("/health")
 def health() -> dict[str, str]:
     """Often used by load balancers or monitoring to check the service is up."""
-    return {"status": "ok!"}
+    return {"status": "ok"}
 
 @app.get("/info")
 def info() -> list[str]:
