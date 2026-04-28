@@ -32,6 +32,10 @@ def health() -> dict[str, str]:
     """Often used by load balancers or monitoring to check the service is up."""
     return {"status": "ok"}
 
+@app.get("/info")
+def info() -> dict[str, str]:
+    """Return information about the items."""
+    return list(map(lambda x: f"Item {x.name}: {x.description}", _items))
 
 @app.get("/items", response_model=list[Item])
 def list_items() -> list[Item]:
