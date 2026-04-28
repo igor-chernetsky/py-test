@@ -1,18 +1,22 @@
-yaml
 name: Deploy to EC2
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: appleboy/ssh-action@v0.1.10
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v0.1.10
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          script: /home/ec2-user/deploy.sh
+          script: |
+            /home/ec2-user/deploy.sh
