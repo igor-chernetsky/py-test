@@ -7,6 +7,7 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 """
 
 import os
+import logging
 
 import boto3
 import psycopg2
@@ -23,6 +24,7 @@ app = FastAPI(
 # In-memory store (resets when the server restarts — fine for practice).
 _items: list[Item] = []
 _next_id: int = 1
+logger = logging.getLogger("healthcheck.db")
 
 
 def get_db_status() -> str:
@@ -32,15 +34,28 @@ def get_db_status() -> str:
     """
     host = os.getenv("RDSHOST")
     if not host:
+        logger.warning("DB health check skipped: RDSHOST is not set")
         return "not_configured"
 
     region = os.getenv("AWS_REGION", "eu-north-1")
-    port = int(os.getenv("RDSPORT", "5432"))
+    raw_port = os.getenv("RDSPORT", "5432")
     dbname = os.getenv("RDSDB", "postgres")
     user = os.getenv("RDSUSER", "postgres")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.exception("DB health check failed: RDSPORT is not a valid integer", extra={"RDSPORT": raw_port})
+        return "down"
+
+    logger.info(
+        "DB health check started",
+        extra={"RDSHOST": host, "RDSPORT": port, "RDSDB": dbname, "RDSUSER": user, "AWS_REGION": region},
+    )
 
     try:
+        logger.info("Creating boto3 RDS client")
         rds = boto3.client("rds", region_name=region)
+        logger.info("Generating IAM auth token for RDS")
         token = rds.generate_db_auth_token(
             DBHostname=host,
             Port=port,
@@ -48,6 +63,7 @@ def get_db_status() -> str:
             Region=region,
         )
 
+        logger.info("Opening PostgreSQL connection with SSL")
         conn = psycopg2.connect(
             host=host,
             port=port,
@@ -58,13 +74,17 @@ def get_db_status() -> str:
             connect_timeout=5,
         )
         try:
+            logger.info("Running DB probe query: SELECT 1")
             with conn.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
         finally:
             conn.close()
+            logger.info("PostgreSQL connection closed")
     except Exception:
+        logger.exception("DB health check failed during connection/probe")
         return "down"
+    logger.info("DB health check succeeded")
     return "up"
 
 
