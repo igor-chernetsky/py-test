@@ -6,6 +6,10 @@ Run locally:
 Then open http://127.0.0.1:8000/docs for interactive API docs.
 """
 
+import os
+
+import boto3
+import psycopg2
 from fastapi import FastAPI, HTTPException
 
 from schemas import Item, ItemCreate
@@ -21,6 +25,49 @@ _items: list[Item] = []
 _next_id: int = 1
 
 
+def get_db_status() -> str:
+    """
+    Check PostgreSQL connectivity using RDS IAM auth token.
+    Returns a short status string for the health endpoint.
+    """
+    host = os.getenv("RDSHOST")
+    if not host:
+        return "not_configured"
+
+    region = os.getenv("AWS_REGION", "eu-north-1")
+    port = int(os.getenv("RDSPORT", "5432"))
+    dbname = os.getenv("RDSDB", "postgres")
+    user = os.getenv("RDSUSER", "postgres")
+
+    try:
+        rds = boto3.client("rds", region_name=region)
+        token = rds.generate_db_auth_token(
+            DBHostname=host,
+            Port=port,
+            DBUsername=user,
+            Region=region,
+        )
+
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=token,
+            sslmode="require",
+            connect_timeout=5,
+        )
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return "down"
+    return "up"
+
+
 @app.get("/")
 def read_root() -> dict[str, str]:
     """Simple GET — no path parameters or body."""
@@ -30,7 +77,7 @@ def read_root() -> dict[str, str]:
 @app.get("/health")
 def health() -> dict[str, str]:
     """Often used by load balancers or monitoring to check the service is up."""
-    return {"status": "ok"}
+    return {"status": "ok", "db_status": get_db_status()}
 
 @app.get("/info")
 def info() -> list[str]:
