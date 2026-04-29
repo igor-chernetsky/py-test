@@ -31,6 +31,8 @@ def get_db_status() -> str:
     Check PostgreSQL connectivity using password auth.
     Returns a short status string for the health endpoint.
     """
+    print(f"=== DEBUG: RDSHOST from os.getenv = {os.getenv('RDSHOST')} ===")
+    print(f"=== DEBUG: RDSHOST from os.environ = {os.environ.get('RDSHOST')} ===")
     host = os.getenv("RDSHOST")
     if not host:
         logger.warning("DB health check skipped: RDSHOST is not set")
