@@ -9,7 +9,6 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 import os
 import logging
 
-import boto3
 import psycopg2
 from fastapi import FastAPI, HTTPException
 
@@ -29,7 +28,7 @@ logger = logging.getLogger("healthcheck.db")
 
 def get_db_status() -> str:
     """
-    Check PostgreSQL connectivity using RDS IAM auth token.
+    Check PostgreSQL connectivity using password auth.
     Returns a short status string for the health endpoint.
     """
     host = os.getenv("RDSHOST")
@@ -37,10 +36,12 @@ def get_db_status() -> str:
         logger.warning("DB health check skipped: RDSHOST is not set")
         return "not_configured"
 
-    region = os.getenv("AWS_REGION", "eu-north-1")
     raw_port = os.getenv("RDSPORT", "5432")
     dbname = os.getenv("RDSDB", "postgres")
     user = os.getenv("RDSUSER", "postgres")
+    password = os.getenv("RDSPASSWORD")
+    sslmode = os.getenv("SSLMODE", "require")
+    sslrootcert = os.getenv("SSLROOTCERT")
     try:
         port = int(raw_port)
     except ValueError:
@@ -49,29 +50,38 @@ def get_db_status() -> str:
 
     logger.info(
         "DB health check started",
-        extra={"RDSHOST": host, "RDSPORT": port, "RDSDB": dbname, "RDSUSER": user, "AWS_REGION": region},
+        extra={
+            "RDSHOST": host,
+            "RDSPORT": port,
+            "RDSDB": dbname,
+            "RDSUSER": user,
+            "RDSPASSWORD_SET": bool(password),
+            "SSLMODE": sslmode,
+            "SSLROOTCERT_SET": bool(sslrootcert),
+        },
     )
 
     try:
-        logger.info("Creating boto3 RDS client")
-        rds = boto3.client("rds", region_name=region)
-        logger.info("Generating IAM auth token for RDS")
-        token = rds.generate_db_auth_token(
-            DBHostname=host,
-            Port=port,
-            DBUsername=user,
-            Region=region,
-        )
+        if not password:
+            logger.warning("DB health check failed: RDSPASSWORD is not set")
+            return "down"
+        logger.info("Using password auth from RDSPASSWORD")
 
         logger.info("Opening PostgreSQL connection with SSL")
+        connect_kwargs = {
+            "host": host,
+            "port": port,
+            "dbname": dbname,
+            "user": user,
+            "password": password,
+            "sslmode": sslmode,
+            "connect_timeout": 5,
+        }
+        if sslrootcert:
+            connect_kwargs["sslrootcert"] = sslrootcert
+
         conn = psycopg2.connect(
-            host=host,
-            port=port,
-            dbname=dbname,
-            user=user,
-            password=token,
-            sslmode="require",
-            connect_timeout=5,
+            **connect_kwargs,
         )
         try:
             logger.info("Running DB probe query: SELECT 1")
