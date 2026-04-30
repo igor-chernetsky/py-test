@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+List new GDELT JSON objects in S3, normalize each article, upsert into PostgreSQL.
+
+Expects files produced by gdelt_fetch_to_s3.py (JSON with an "articles" array).
+
+Env:
+  Same DB vars as main.py: RDSHOST, RDSPORT, RDSDB, RDSUSER, RDSPASSWORD, SSLMODE, SSLROOTCERT
+  S3_BUCKET (default: visorbacket), S3_PREFIX (default: gdelt/)
+
+Run after create_news_tables.py:
+  python scripts/create_news_tables.py
+  python scripts/normalize_news_from_s3.py
+  python scripts/normalize_news_from_s3.py --limit 10
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from typing import Any
+
+import boto3
+from psycopg2.extras import Json
+
+from pg_env import connect_pg
+
+DEFAULT_BUCKET = "visorbacket"
+DEFAULT_PREFIX = "gdelt/"
+
+
+def _pick(d: dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def parse_gdelt_seendate(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if len(s) < 14:
+        return None
+    digits = s[:14]
+    if not digits.isdigit():
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def normalize_article(row: dict[str, Any], bucket: str, key: str) -> tuple[Any, ...]:
+    url = _pick(row, "url", "URL")
+    if not url:
+        return tuple()
+    title = _pick(row, "title", "Title")
+    seen_at = parse_gdelt_seendate(_pick(row, "seendate", "seenDate", "seen_date"))
+    domain = _pick(row, "domain", "Domain")
+    language = _pick(row, "language", "Language")
+    country = _pick(row, "sourcecountry", "sourceCountry", "SourceCountry")
+    image = _pick(row, "socialimage", "socialImage", "SocialImage")
+    snippet = {k: v for k, v in row.items() if k not in ("url", "URL")} or None
+    return (
+        str(url).strip(),
+        str(title).strip() if title else None,
+        seen_at,
+        str(domain).strip() if domain else None,
+        str(language).strip() if language else None,
+        str(country).strip() if country else None,
+        str(image).strip() if image else None,
+        bucket,
+        key,
+        Json(snippet) if snippet else None,
+    )
+
+
+UPSERT_ARTICLE = """
+INSERT INTO news_articles (
+    url, title, seen_at, domain, language, source_country, social_image_url,
+    s3_bucket, s3_object_key, gdelt_snippet
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+)
+ON CONFLICT (url) DO UPDATE SET
+    title = EXCLUDED.title,
+    seen_at = EXCLUDED.seen_at,
+    domain = EXCLUDED.domain,
+    language = EXCLUDED.language,
+    source_country = EXCLUDED.source_country,
+    social_image_url = EXCLUDED.social_image_url,
+    s3_bucket = EXCLUDED.s3_bucket,
+    s3_object_key = EXCLUDED.s3_object_key,
+    gdelt_snippet = EXCLUDED.gdelt_snippet,
+    updated_at = now();
+"""
+
+UPSERT_INGEST = """
+INSERT INTO news_s3_ingest (
+    s3_bucket, s3_key, etag, article_count, status, error_message, completed_at
+) VALUES (%s, %s, %s, %s, %s, %s, now())
+ON CONFLICT (s3_bucket, s3_key) DO UPDATE SET
+    etag = EXCLUDED.etag,
+    article_count = EXCLUDED.article_count,
+    status = EXCLUDED.status,
+    error_message = EXCLUDED.error_message,
+    completed_at = now();
+"""
+
+
+def list_json_keys(s3, bucket: str, prefix: str) -> list[dict[str, Any]]:
+    keys: list[dict[str, Any]] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents") or []:
+            k = obj.get("Key") or ""
+            if k.endswith(".json"):
+                keys.append({"Key": k, "ETag": obj.get("ETag")})
+    return keys
+
+
+def load_completed_keys(conn, bucket: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s3_key FROM news_s3_ingest
+            WHERE s3_bucket = %s AND status = 'completed'
+            """,
+            (bucket,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def process_object(s3, conn, bucket: str, key: str, etag: str | None) -> tuple[int, str | None]:
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return 0, f"invalid json: {e}"
+
+    articles = data.get("articles")
+    if articles is None:
+        return 0, "missing top-level 'articles' key (not GDELT ArtList JSON?)"
+    if not isinstance(articles, list):
+        return 0, f"'articles' must be a list, got {type(articles).__name__}"
+
+    count = 0
+    with conn.cursor() as cur:
+        for row in articles:
+            if not isinstance(row, dict):
+                continue
+            tup = normalize_article(row, bucket, key)
+            if not tup:
+                continue
+            cur.execute(UPSERT_ARTICLE, tup)
+            count += 1
+        cur.execute(
+            UPSERT_INGEST,
+            (bucket, key, etag, count, "completed", None),
+        )
+    return count, None
+
+
+def mark_failed(conn, bucket: str, key: str, etag: str | None, err: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            UPSERT_INGEST,
+            (bucket, key, etag, 0, "failed", err[:2000]),
+        )
+
+
+def main() -> int:
+    import os
+
+    parser = argparse.ArgumentParser(description="Normalize GDELT JSON from S3 into PostgreSQL")
+    parser.add_argument("--bucket", default=os.environ.get("S3_BUCKET", DEFAULT_BUCKET))
+    parser.add_argument(
+        "--prefix",
+        default=os.environ.get("S3_PREFIX", DEFAULT_PREFIX),
+        help="S3 prefix for gdelt json files",
+    )
+    parser.add_argument("--limit", type=int, default=0, help="Max new objects to process (0 = all)")
+    parser.add_argument("--dry-run", action="store_true", help="List objects only, no DB/S3 body reads")
+    args = parser.parse_args()
+
+    prefix = args.prefix.rstrip("/") + "/"
+    bucket = args.bucket
+
+    s3 = boto3.client("s3")
+    keys = list_json_keys(s3, bucket, prefix)
+    print(f"Found {len(keys)} .json objects under s3://{bucket}/{prefix}")
+
+    if args.dry_run:
+        for item in keys[:20]:
+            print(" ", item["Key"])
+        if len(keys) > 20:
+            print(f"  ... and {len(keys) - 20} more")
+        return 0
+
+    try:
+        conn = connect_pg()
+    except Exception as e:
+        print(f"Database connection failed: {e}", file=sys.stderr)
+        return 1
+
+    completed = load_completed_keys(conn, bucket)
+    conn.commit()
+
+    pending = [item for item in keys if item["Key"] not in completed]
+    if args.limit:
+        pending = pending[: args.limit]
+
+    processed = 0
+    try:
+        for item in pending:
+            key = item["Key"]
+            etag = item.get("ETag")
+            if etag and isinstance(etag, str):
+                etag = etag.strip('"')
+
+            try:
+                n, err = process_object(s3, conn, bucket, key, etag)
+                if err:
+                    conn.rollback()
+                    mark_failed(conn, bucket, key, etag, err)
+                conn.commit()
+                print(f"OK s3://{bucket}/{key} -> {n} articles" if not err else f"SKIP s3://{bucket}/{key}: {err}")
+                processed += 1
+            except Exception as e:
+                conn.rollback()
+                try:
+                    mark_failed(conn, bucket, key, etag, str(e))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                print(f"FAIL s3://{bucket}/{key}: {e}", file=sys.stderr)
+                processed += 1
+    finally:
+        conn.close()
+
+    print(f"Finished. New files processed this run: {processed}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
