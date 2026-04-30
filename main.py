@@ -10,19 +10,15 @@ import os
 import logging
 
 import psycopg2
-from fastapi import FastAPI, HTTPException
-
-from schemas import Item, ItemCreate
+from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, Query
 
 app = FastAPI(
     title="Learning API",
-    description="A tiny FastAPI example for learning Python and REST basics.",
-    version="0.1.0",
+    description="Simple API with health check and news list from PostgreSQL.",
+    version="0.2.0",
 )
 
-# In-memory store (resets when the server restarts — fine for practice).
-_items: list[Item] = []
-_next_id: int = 1
 logger = logging.getLogger("healthcheck.db")
 
 
@@ -98,45 +94,80 @@ def get_db_status() -> str:
     return "up"
 
 
-@app.get("/")
-def read_root() -> dict[str, str]:
-    """Simple GET — no path parameters or body."""
-    return {"message": "Hello — try GET /items or open /docs"}
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     """Often used by load balancers or monitoring to check the service is up."""
     return {"status": "ok", "db_status": get_db_status()}
 
-@app.get("/info")
-def info() -> list[str]:
-    """Return information about the items."""
-    return [f"Item {item.name}: {item.description}" for item in _items]
 
-@app.get("/items", response_model=list[Item])
-def list_items() -> list[Item]:
-    """Return all items. `response_model` tells FastAPI how to serialize the JSON."""
-    return _items
-
-
-@app.get("/items/{item_id}", response_model=Item)
-def get_item(item_id: int) -> Item:
-    """Path parameter `item_id` is parsed as int; 404 if not found."""
-    for item in _items:
-        if item.id == item_id:
-            return item
-    raise HTTPException(status_code=404, detail="Item not found")
+def get_db_connection():
+    connect_kwargs = {
+        "host": os.getenv("RDSHOST"),
+        "port": int(os.getenv("RDSPORT", "5432")),
+        "dbname": os.getenv("RDSDB", "postgres"),
+        "user": os.getenv("RDSUSER", "postgres"),
+        "password": os.getenv("RDSPASSWORD"),
+        "sslmode": os.getenv("SSLMODE", "require"),
+        "connect_timeout": 10,
+    }
+    sslrootcert = os.getenv("SSLROOTCERT")
+    if sslrootcert:
+        connect_kwargs["sslrootcert"] = sslrootcert
+    return psycopg2.connect(**connect_kwargs)
 
 
-@app.post("/items", response_model=Item, status_code=201)
-def create_item(body: ItemCreate) -> Item:
+@app.get("/news")
+def list_news(
+    q: str | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    source_country: str | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
     """
-    Request body is validated against ItemCreate automatically.
-    Returns 201 Created with the new item (including assigned id).
+    List normalized news from PostgreSQL with optional filters.
     """
-    global _next_id
-    new_item = Item(id=_next_id, name=body.name, description=body.description)
-    _next_id += 1
-    _items.append(new_item)
-    return new_item
+    where_parts: list[str] = []
+    values: list[object] = []
+
+    if q:
+        where_parts.append("(title ILIKE %s OR url ILIKE %s)")
+        pattern = f"%{q}%"
+        values.extend([pattern, pattern])
+    if domain:
+        where_parts.append("domain = %s")
+        values.append(domain)
+    if language:
+        where_parts.append("language = %s")
+        values.append(language)
+    if source_country:
+        where_parts.append("source_country = %s")
+        values.append(source_country)
+
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    sql = f"""
+        SELECT
+            url,
+            title,
+            seen_at,
+            domain,
+            language,
+            source_country,
+            social_image_url,
+            s3_bucket,
+            s3_object_key
+        FROM news_articles
+        {where_sql}
+        ORDER BY seen_at DESC NULLS LAST, id DESC
+        LIMIT %s OFFSET %s
+    """
+    values.extend([limit, offset])
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, values)
+            rows = cur.fetchall()
+
+    return {"count": len(rows), "items": rows}

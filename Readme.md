@@ -11,3 +11,12 @@ tail -50 /var/log/gdelt_fetcher.log
 
 # the last files in s3
 aws s3 ls s3://visorbacket/gdelt/ --recursive | sort | tail -5
+
+#env var
+sudo cat /etc/systemd/system/fastapi.service.d/override.conf
+
+# check normolization execution
+grep "Normalization" /home/ec2-user/py-test/logs/normalizer.log | tail -5
+
+# check last 10 normalizations
+grep "finished at" /home/ec2-user/py-test/logs/normalizer.log | tail -10
