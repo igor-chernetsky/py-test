@@ -4,6 +4,7 @@ FastAPI application: HTTP routes and in-memory "database" for learning.
 Run locally:
     uvicorn main:app --reload
 Then open http://127.0.0.1:8000/docs for interactive API docs.
+Routes are under /api (e.g. /api/health, /api/news).
 """
 
 import os
@@ -11,13 +12,14 @@ import logging
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Query
+from fastapi import APIRouter, FastAPI, Query
 
 app = FastAPI(
     title="Learning API",
     description="Simple API with health check and news list from PostgreSQL.",
     version="0.2.0",
 )
+api_router = APIRouter(prefix="/api")
 
 logger = logging.getLogger("healthcheck.db")
 
@@ -94,7 +96,7 @@ def get_db_status() -> str:
     return "up"
 
 
-@app.get("/health")
+@api_router.get("/health")
 def health() -> dict[str, str]:
     """Often used by load balancers or monitoring to check the service is up."""
     return {"status": "ok", "db_status": get_db_status()}
@@ -116,7 +118,7 @@ def get_db_connection():
     return psycopg2.connect(**connect_kwargs)
 
 
-@app.get("/news")
+@api_router.get("/news")
 def list_news(
     q: str | None = None,
     domain: str | None = None,
@@ -171,3 +173,6 @@ def list_news(
             rows = cur.fetchall()
 
     return {"count": len(rows), "items": rows}
+
+
+app.include_router(api_router)
