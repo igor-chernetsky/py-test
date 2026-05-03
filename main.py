@@ -7,8 +7,9 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 Routes are under /api (e.g. /api/health, /api/news).
 """
 
-import os
 import logging
+import os
+from typing import Literal
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -126,6 +127,13 @@ def list_news(
     source_country: str | None = None,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    order_by: Literal["created_at", "seen_at"] = Query(
+        default="created_at",
+        description=(
+            "created_at: newest ingested rows first (matches typical SQL ORDER BY created_at). "
+            "seen_at: GDELT 'seen' time first."
+        ),
+    ),
 ) -> dict[str, object]:
     """
     List normalized news from PostgreSQL with optional filters.
@@ -149,6 +157,12 @@ def list_news(
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
+    order_sql = (
+        "created_at DESC NULLS LAST, id DESC"
+        if order_by == "created_at"
+        else "seen_at DESC NULLS LAST, id DESC"
+    )
+
     sql = f"""
         SELECT
             url,
@@ -163,7 +177,7 @@ def list_news(
             s3_object_key
         FROM news_articles
         {where_sql}
-        ORDER BY seen_at DESC NULLS LAST, id DESC
+        ORDER BY {order_sql}
         LIMIT %s OFFSET %s
     """
     values.extend([limit, offset])
