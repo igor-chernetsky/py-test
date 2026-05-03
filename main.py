@@ -13,7 +13,7 @@ from typing import Literal
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, FastAPI, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query
 
 app = FastAPI(
     title="Learning API",
@@ -203,6 +203,35 @@ def list_news(
             rows = cur.fetchall()
 
     return {"count": len(rows), "items": rows}
+
+
+@api_router.get("/news/detail")
+def get_news_detail(url: str = Query(..., min_length=1)) -> dict[str, object]:
+    """One article by exact URL, including GDELT JSON snippet (may hold an excerpt)."""
+    sql = """
+        SELECT
+            url,
+            title,
+            seen_at,
+            created_at,
+            domain,
+            language,
+            source_country,
+            social_image_url,
+            s3_bucket,
+            s3_object_key,
+            gdelt_snippet
+        FROM news_articles
+        WHERE url = %s
+        LIMIT 1
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (url,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Article not found")
+    return dict(row)
 
 
 app.include_router(api_router)
