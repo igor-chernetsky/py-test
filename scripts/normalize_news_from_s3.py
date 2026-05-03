@@ -7,17 +7,23 @@ Expects files produced by gdelt_fetch_to_s3.py (JSON with an "articles" array).
 Env:
   Same DB vars as main.py: RDSHOST, RDSPORT, RDSDB, RDSUSER, RDSPASSWORD, SSLMODE, SSLROOTCERT
   S3_BUCKET (default: visorbacket), S3_PREFIX (default: gdelt/)
+  EMBEDDING_MODEL (default: all-MiniLM-L6-v2) — sentence-transformers; output dim must match DB (384).
+  EMBEDDING_DIM (default: 384) — must match column `embedding vector(384)` and the model output size.
+
+Requires: CREATE EXTENSION vector; column news_articles.embedding (see create_news_tables.py).
 
 Run after create_news_tables.py:
   python scripts/create_news_tables.py
   python scripts/normalize_news_from_s3.py
   python scripts/normalize_news_from_s3.py --limit 10
+  python scripts/normalize_news_from_s3.py --no-embed   # skip sentence-transformers (no vector fill)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -29,6 +35,84 @@ from pg_env import connect_pg
 
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
+
+_EMBED_MODEL = None
+
+
+def get_embed_model():
+    """Lazy-load SentenceTransformer (heavy); only when embeddings enabled."""
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
+        name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _EMBED_MODEL = SentenceTransformer(name)
+    return _EMBED_MODEL
+
+
+def embedding_dim_expected() -> int:
+    return int(os.environ.get("EMBEDDING_DIM", "384"))
+
+
+def build_embedding_text(title: str | None, snippet: dict[str, Any] | None) -> str:
+    parts: list[str] = []
+    if title and str(title).strip():
+        parts.append(str(title).strip())
+    if snippet:
+        for key in (
+            "description",
+            "Description",
+            "snippet",
+            "Snippet",
+            "excerpt",
+            "Excerpt",
+            "summary",
+            "Summary",
+            "quote",
+            "Quote",
+            "context",
+            "Context",
+        ):
+            v = snippet.get(key)
+            if isinstance(v, str) and v.strip():
+                parts.append(v.strip()[:800])
+                break
+    text = " ".join(parts).strip()
+    return text if text else "news article"
+
+
+def vector_literal_from_text(text: str, no_embed: bool) -> str | None:
+    if no_embed:
+        return None
+    model = get_embed_model()
+    vec = model.encode(text[:5000], normalize=True, show_progress_bar=False)
+    dim = int(vec.shape[0]) if hasattr(vec, "shape") else len(vec)
+    expected = embedding_dim_expected()
+    if dim != expected:
+        raise RuntimeError(
+            f"Model embedding dim is {dim} but EMBEDDING_DIM / DB column expect {expected}. "
+            "Set EMBEDDING_MODEL / EMBEDDING_DIM to match create_news_tables.py vector(N)."
+        )
+    return "[" + ",".join(str(float(x)) for x in vec.tolist()) + "]"
+
+
+def title_taken_by_other_url(cur, title: str | None, url: str) -> bool:
+    """True if another row already has this title (btrim, case-insensitive)."""
+    t = (title or "").strip()
+    if not t:
+        return False
+    u = url.strip()
+    cur.execute(
+        """
+        SELECT 1 FROM news_articles
+        WHERE lower(btrim(COALESCE(title, ''))) = lower(btrim(COALESCE(%s, '')))
+          AND length(btrim(COALESCE(%s, ''))) > 0
+          AND url <> %s
+        LIMIT 1
+        """,
+        (t, t, u),
+    )
+    return cur.fetchone() is not None
 
 
 def _pick(d: dict[str, Any], *keys: str) -> Any:
@@ -81,6 +165,30 @@ def normalize_article(row: dict[str, Any], bucket: str, key: str) -> tuple[Any, 
 UPSERT_ARTICLE = """
 INSERT INTO news_articles (
     url, title, seen_at, domain, language, source_country, social_image_url,
+    s3_bucket, s3_object_key, gdelt_snippet, embedding
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector
+)
+ON CONFLICT (url) DO UPDATE SET
+    title = EXCLUDED.title,
+    seen_at = EXCLUDED.seen_at,
+    domain = EXCLUDED.domain,
+    language = EXCLUDED.language,
+    source_country = EXCLUDED.source_country,
+    social_image_url = EXCLUDED.social_image_url,
+    s3_bucket = EXCLUDED.s3_bucket,
+    s3_object_key = EXCLUDED.s3_object_key,
+    gdelt_snippet = EXCLUDED.gdelt_snippet,
+    embedding = COALESCE(EXCLUDED.embedding, news_articles.embedding),
+    updated_at = now();
+"""
+
+
+def upsert_article_sql(no_embed: bool) -> str:
+    if no_embed:
+        return """
+INSERT INTO news_articles (
+    url, title, seen_at, domain, language, source_country, social_image_url,
     s3_bucket, s3_object_key, gdelt_snippet
 ) VALUES (
     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
@@ -97,6 +205,8 @@ ON CONFLICT (url) DO UPDATE SET
     gdelt_snippet = EXCLUDED.gdelt_snippet,
     updated_at = now();
 """
+    return UPSERT_ARTICLE
+
 
 UPSERT_INGEST = """
 INSERT INTO news_s3_ingest (
@@ -134,7 +244,15 @@ def load_completed_keys(conn, bucket: str) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
-def process_object(s3, conn, bucket: str, key: str, etag: str | None) -> tuple[int, str | None]:
+def process_object(
+    s3,
+    conn,
+    bucket: str,
+    key: str,
+    etag: str | None,
+    *,
+    no_embed: bool,
+) -> tuple[int, str | None]:
     body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     try:
         data = json.loads(body.decode("utf-8"))
@@ -147,6 +265,7 @@ def process_object(s3, conn, bucket: str, key: str, etag: str | None) -> tuple[i
     if not isinstance(articles, list):
         return 0, f"'articles' must be a list, got {type(articles).__name__}"
 
+    sql = upsert_article_sql(no_embed)
     count = 0
     with conn.cursor() as cur:
         for row in articles:
@@ -155,7 +274,21 @@ def process_object(s3, conn, bucket: str, key: str, etag: str | None) -> tuple[i
             tup = normalize_article(row, bucket, key)
             if not tup:
                 continue
-            cur.execute(UPSERT_ARTICLE, tup)
+            url = tup[0]
+            title = tup[1]
+            snippet_dict: dict[str, Any] | None = (
+                {k: v for k, v in row.items() if k not in ("url", "URL")} or None
+            )
+
+            if title_taken_by_other_url(cur, title, url):
+                continue
+
+            if no_embed:
+                cur.execute(sql, tup)
+            else:
+                emb_text = build_embedding_text(title, snippet_dict)
+                vec_lit = vector_literal_from_text(emb_text, no_embed=False)
+                cur.execute(sql, (*tup, vec_lit))
             count += 1
         cur.execute(
             UPSERT_INGEST,
@@ -173,8 +306,6 @@ def mark_failed(conn, bucket: str, key: str, etag: str | None, err: str) -> None
 
 
 def main() -> int:
-    import os
-
     parser = argparse.ArgumentParser(description="Normalize GDELT JSON from S3 into PostgreSQL")
     parser.add_argument("--bucket", default=os.environ.get("S3_BUCKET", DEFAULT_BUCKET))
     parser.add_argument(
@@ -184,6 +315,11 @@ def main() -> int:
     )
     parser.add_argument("--limit", type=int, default=0, help="Max new objects to process (0 = all)")
     parser.add_argument("--dry-run", action="store_true", help="List objects only, no DB/S3 body reads")
+    parser.add_argument(
+        "--no-embed",
+        action="store_true",
+        help="Do not load sentence-transformers or write embedding (column must allow NULL or omit in SQL)",
+    )
     args = parser.parse_args()
 
     prefix = args.prefix.rstrip("/") + "/"
@@ -222,7 +358,7 @@ def main() -> int:
                 etag = etag.strip('"')
 
             try:
-                n, err = process_object(s3, conn, bucket, key, etag)
+                n, err = process_object(s3, conn, bucket, key, etag, no_embed=args.no_embed)
                 if err:
                     conn.rollback()
                     mark_failed(conn, bucket, key, etag, err)

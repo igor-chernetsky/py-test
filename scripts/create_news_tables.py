@@ -5,6 +5,12 @@ Create PostgreSQL tables for normalized GDELT news and S3 ingest tracking.
 Uses the same env vars as main.py:
   RDSHOST, RDSPORT, RDSDB, RDSUSER, RDSPASSWORD, SSLMODE, SSLROOTCERT (optional)
 
+Creates pgvector extension and `news_articles.embedding vector(384)` for
+`sentence-transformers` default model `all-MiniLM-L6-v2` (override with EMBEDDING_MODEL / EMBEDDING_DIM).
+
+On RDS, `CREATE EXTENSION vector` may require an allowed extension list / admin;
+if it fails, enable `vector` in the parameter group or run the extension SQL as admin.
+
 Run:
   python scripts/create_news_tables.py
   python scripts/create_news_tables.py --dry-run
@@ -16,6 +22,9 @@ import argparse
 import sys
 
 DDL_STATEMENTS = [
+    """
+    CREATE EXTENSION IF NOT EXISTS vector;
+    """,
     """
     CREATE TABLE IF NOT EXISTS news_s3_ingest (
         id BIGSERIAL PRIMARY KEY,
@@ -43,9 +52,14 @@ DDL_STATEMENTS = [
         s3_bucket TEXT NOT NULL,
         s3_object_key TEXT NOT NULL,
         gdelt_snippet JSONB,
+        embedding vector(384),
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    """,
+    """
+    ALTER TABLE news_articles
+        ADD COLUMN IF NOT EXISTS embedding vector(384);
     """,
     """
     CREATE INDEX IF NOT EXISTS news_articles_seen_at_idx
@@ -58,6 +72,10 @@ DDL_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS news_articles_s3_key_idx
         ON news_articles (s3_bucket, s3_object_key);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS news_articles_title_lower_btrim_idx
+        ON news_articles (lower(btrim(COALESCE(title, ''))));
     """,
 ]
 
