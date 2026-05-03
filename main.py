@@ -186,6 +186,7 @@ def list_news(
 
     sql = f"""
         SELECT
+            id,
             url,
             title,
             seen_at,
@@ -199,6 +200,7 @@ def list_news(
             gdelt_snippet
         FROM (
             SELECT DISTINCT ON (url)
+                id,
                 url,
                 title,
                 seen_at,
