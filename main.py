@@ -7,8 +7,10 @@ Then open http://127.0.0.1:8000/docs for interactive API docs.
 Routes are under /api (e.g. /api/health, /api/news).
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 
 import psycopg2
@@ -23,6 +25,48 @@ app = FastAPI(
 api_router = APIRouter(prefix="/api")
 
 logger = logging.getLogger("healthcheck.db")
+
+
+def _load_topic_vector_literals() -> dict[str, str]:
+    """
+    Precomputed all-MiniLM-L6-v2 vectors (384-dim, L2-normalized) for home-page topic chips.
+    Built by scripts/export_topic_embeddings.py — avoids sentence-transformers/torch on the API host.
+    """
+    path = Path(__file__).resolve().parent / "topic_embeddings.json"
+    if not path.is_file():
+        logger.warning("topic_embeddings.json not found next to main.py; topic= search disabled")
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, str] = {}
+    for slug, arr in raw.items():
+        if not isinstance(arr, list):
+            continue
+        out[str(slug)] = "[" + ",".join(str(float(x)) for x in arr) + "]"
+    return out
+
+
+TOPIC_VECTOR_LITERALS: dict[str, str] = _load_topic_vector_literals()
+
+# Phrases the older visor sent as `topic=` before switching to slugs.
+_LEGACY_TOPIC_PHRASE_TO_SLUG: dict[str, str] = {
+    "climate change environment energy sustainability": "climate",
+    "technology software artificial intelligence computing": "technology",
+    "health medicine public health disease healthcare": "health",
+}
+
+
+def _resolve_topic_vector_literal(topic_param: str) -> str | None:
+    if not TOPIC_VECTOR_LITERALS:
+        return None
+    key = " ".join(topic_param.strip().lower().replace("+", " ").split())
+    if not key:
+        return None
+    if key in TOPIC_VECTOR_LITERALS:
+        return TOPIC_VECTOR_LITERALS[key]
+    slug = _LEGACY_TOPIC_PHRASE_TO_SLUG.get(key)
+    if slug and slug in TOPIC_VECTOR_LITERALS:
+        return TOPIC_VECTOR_LITERALS[slug]
+    return None
 
 
 def get_db_status() -> str:
@@ -119,30 +163,6 @@ def get_db_connection():
     return psycopg2.connect(**connect_kwargs)
 
 
-_embed_model = None
-
-
-def embed_text_to_vector_literal(text: str) -> str:
-    """
-    Encode text with the same model / dim as scripts/normalize_news_from_s3.py
-    for pgvector similarity against news_articles.embedding.
-    """
-    global _embed_model
-    if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-
-        name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-        _embed_model = SentenceTransformer(name)
-    vec = _embed_model.encode(text[:5000], normalize=True, show_progress_bar=False)
-    dim = int(vec.shape[0]) if hasattr(vec, "shape") else len(vec)
-    expected = int(os.getenv("EMBEDDING_DIM", "384"))
-    if dim != expected:
-        raise RuntimeError(
-            f"Model embedding dim is {dim} but EMBEDDING_DIM / DB column expect {expected}."
-        )
-    return "[" + ",".join(str(float(x)) for x in vec.tolist()) + "]"
-
-
 @api_router.get("/news/languages")
 def list_news_languages() -> dict[str, list[str]]:
     """Distinct non-empty language values for filter dropdowns."""
@@ -167,8 +187,8 @@ def list_news(
     topic: str | None = Query(
         default=None,
         description=(
-            "If set, rank deduplicated rows by embedding cosine distance to this phrase "
-            "(requires sentence-transformers and non-null embedding rows)."
+            "Topic slug (climate, technology, health): rank by pgvector similarity using "
+            "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
@@ -189,14 +209,20 @@ def list_news(
     use_vector = bool(topic_clean)
     vec_lit: str | None = None
     if use_vector:
-        try:
-            vec_lit = embed_text_to_vector_literal(topic_clean)
-        except Exception as e:
-            logger.exception("topic embedding failed")
+        vec_lit = _resolve_topic_vector_literal(topic_clean)
+        if vec_lit is None:
+            if not TOPIC_VECTOR_LITERALS:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Topic search is not configured (missing topic_embeddings.json on server).",
+                )
             raise HTTPException(
-                status_code=503,
-                detail=f"Embedding unavailable: {e!s}",
-            ) from e
+                status_code=400,
+                detail=(
+                    "Unknown topic. Use one of: climate, technology, health "
+                    "(or redeploy with matching topic_embeddings.json)."
+                ),
+            )
 
     where_parts: list[str] = []
     values: list[object] = []
