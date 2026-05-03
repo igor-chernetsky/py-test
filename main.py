@@ -189,7 +189,8 @@ def list_news(
             source_country,
             social_image_url,
             s3_bucket,
-            s3_object_key
+            s3_object_key,
+            gdelt_snippet
         FROM news_articles
         {where_sql}
         ORDER BY {order_sql}
