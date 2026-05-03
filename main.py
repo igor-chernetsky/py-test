@@ -154,6 +154,7 @@ def list_news(
             url,
             title,
             seen_at,
+            created_at,
             domain,
             language,
             source_country,
