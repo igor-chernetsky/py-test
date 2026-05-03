@@ -177,6 +177,12 @@ def list_news(
         if order_by == "created_at"
         else "seen_at DESC NULLS LAST, id DESC"
     )
+    # Pick one row per URL (latest by the same sort key) so duplicates never reach the client.
+    inner_order_tail = (
+        "created_at DESC NULLS LAST, id DESC"
+        if order_by == "created_at"
+        else "seen_at DESC NULLS LAST, id DESC"
+    )
 
     sql = f"""
         SELECT
@@ -191,8 +197,23 @@ def list_news(
             s3_bucket,
             s3_object_key,
             gdelt_snippet
-        FROM news_articles
-        {where_sql}
+        FROM (
+            SELECT DISTINCT ON (url)
+                url,
+                title,
+                seen_at,
+                created_at,
+                domain,
+                language,
+                source_country,
+                social_image_url,
+                s3_bucket,
+                s3_object_key,
+                gdelt_snippet
+            FROM news_articles
+            {where_sql}
+            ORDER BY url ASC, {inner_order_tail}
+        ) AS deduped
         ORDER BY {order_sql}
         LIMIT %s OFFSET %s
     """
