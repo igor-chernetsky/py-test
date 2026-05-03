@@ -119,6 +119,21 @@ def get_db_connection():
     return psycopg2.connect(**connect_kwargs)
 
 
+@api_router.get("/news/languages")
+def list_news_languages() -> dict[str, list[str]]:
+    """Distinct non-empty language values for filter dropdowns."""
+    sql = """
+        SELECT DISTINCT language FROM news_articles
+        WHERE language IS NOT NULL AND TRIM(language) != ''
+        ORDER BY language ASC
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    return {"languages": [row[0] for row in rows]}
+
+
 @api_router.get("/news")
 def list_news(
     q: str | None = None,
