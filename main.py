@@ -119,6 +119,30 @@ def get_db_connection():
     return psycopg2.connect(**connect_kwargs)
 
 
+_embed_model = None
+
+
+def embed_text_to_vector_literal(text: str) -> str:
+    """
+    Encode text with the same model / dim as scripts/normalize_news_from_s3.py
+    for pgvector similarity against news_articles.embedding.
+    """
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+
+        name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _embed_model = SentenceTransformer(name)
+    vec = _embed_model.encode(text[:5000], normalize=True, show_progress_bar=False)
+    dim = int(vec.shape[0]) if hasattr(vec, "shape") else len(vec)
+    expected = int(os.getenv("EMBEDDING_DIM", "384"))
+    if dim != expected:
+        raise RuntimeError(
+            f"Model embedding dim is {dim} but EMBEDDING_DIM / DB column expect {expected}."
+        )
+    return "[" + ",".join(str(float(x)) for x in vec.tolist()) + "]"
+
+
 @api_router.get("/news/languages")
 def list_news_languages() -> dict[str, list[str]]:
     """Distinct non-empty language values for filter dropdowns."""
@@ -140,19 +164,40 @@ def list_news(
     domain: str | None = None,
     language: str | None = None,
     source_country: str | None = None,
+    topic: str | None = Query(
+        default=None,
+        description=(
+            "If set, rank deduplicated rows by embedding cosine distance to this phrase "
+            "(requires sentence-transformers and non-null embedding rows)."
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order_by: Literal["created_at", "seen_at"] = Query(
         default="created_at",
         description=(
             "created_at: newest ingested rows first (matches typical SQL ORDER BY created_at). "
-            "seen_at: GDELT 'seen' time first."
+            "seen_at: GDELT 'seen' time first. "
+            "Ignored for final ordering when `topic` is set (results ordered by vector similarity)."
         ),
     ),
 ) -> dict[str, object]:
     """
     List normalized news from PostgreSQL with optional filters.
     """
+    topic_clean = (topic or "").strip()
+    use_vector = bool(topic_clean)
+    vec_lit: str | None = None
+    if use_vector:
+        try:
+            vec_lit = embed_text_to_vector_literal(topic_clean)
+        except Exception as e:
+            logger.exception("topic embedding failed")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Embedding unavailable: {e!s}",
+            ) from e
+
     where_parts: list[str] = []
     values: list[object] = []
 
@@ -169,6 +214,8 @@ def list_news(
     if source_country:
         where_parts.append("source_country = %s")
         values.append(source_country)
+    if use_vector:
+        where_parts.append("embedding IS NOT NULL")
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
@@ -184,22 +231,49 @@ def list_news(
         else "seen_at DESC NULLS LAST, id DESC"
     )
 
-    sql = f"""
-        SELECT
-            id,
-            url,
-            title,
-            seen_at,
-            created_at,
-            domain,
-            language,
-            source_country,
-            social_image_url,
-            s3_bucket,
-            s3_object_key,
-            gdelt_snippet
-        FROM (
-            SELECT DISTINCT ON (url)
+    if use_vector and vec_lit is not None:
+        sql = f"""
+            SELECT
+                d.id,
+                d.url,
+                d.title,
+                d.seen_at,
+                d.created_at,
+                d.domain,
+                d.language,
+                d.source_country,
+                d.social_image_url,
+                d.s3_bucket,
+                d.s3_object_key,
+                d.gdelt_snippet
+            FROM (
+                SELECT DISTINCT ON (url)
+                    id,
+                    url,
+                    title,
+                    seen_at,
+                    created_at,
+                    domain,
+                    language,
+                    source_country,
+                    social_image_url,
+                    s3_bucket,
+                    s3_object_key,
+                    gdelt_snippet,
+                    embedding
+                FROM news_articles
+                {where_sql}
+                ORDER BY url ASC, {inner_order_tail}
+            ) AS d
+            CROSS JOIN (SELECT %s::vector AS qv) AS qvec
+            WHERE d.embedding IS NOT NULL
+            ORDER BY d.embedding <=> qvec.qv ASC NULLS LAST
+            LIMIT %s OFFSET %s
+        """
+        values.extend([vec_lit, limit, offset])
+    else:
+        sql = f"""
+            SELECT
                 id,
                 url,
                 title,
@@ -212,14 +286,28 @@ def list_news(
                 s3_bucket,
                 s3_object_key,
                 gdelt_snippet
-            FROM news_articles
-            {where_sql}
-            ORDER BY url ASC, {inner_order_tail}
-        ) AS deduped
-        ORDER BY {order_sql}
-        LIMIT %s OFFSET %s
-    """
-    values.extend([limit, offset])
+            FROM (
+                SELECT DISTINCT ON (url)
+                    id,
+                    url,
+                    title,
+                    seen_at,
+                    created_at,
+                    domain,
+                    language,
+                    source_country,
+                    social_image_url,
+                    s3_bucket,
+                    s3_object_key,
+                    gdelt_snippet
+                FROM news_articles
+                {where_sql}
+                ORDER BY url ASC, {inner_order_tail}
+            ) AS deduped
+            ORDER BY {order_sql}
+            LIMIT %s OFFSET %s
+        """
+        values.extend([limit, offset])
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
