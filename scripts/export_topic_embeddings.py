@@ -3,7 +3,8 @@
 Emit topic_embeddings.json for main.py (same model/dim as normalize_news_from_s3.py).
 
 Run locally after pip install -r requirements.txt (needs sentence-transformers once).
-Writes JSON next to main.py by default.
+Writes JSON next to main.py by default. The API only reads that JSON — you do not need
+this script on the server if topic_embeddings.json is already deployed.
 """
 
 from __future__ import annotations
@@ -48,13 +49,21 @@ def main() -> None:
     try:
         from sentence_transformers import SentenceTransformer
     except ModuleNotFoundError:
+        root = Path(__file__).resolve().parent.parent
+        existing = root / "topic_embeddings.json"
+        extra = ""
+        if existing.is_file():
+            extra = (
+                f"\n\nYou already have {existing} — the FastAPI app uses that file and does "
+                "NOT need sentence-transformers. You can stop here unless you are regenerating "
+                "vectors after changing topic phrases or the embedding model.\n"
+            )
         raise SystemExit(
             "sentence-transformers is not installed in this environment.\n"
-            "  pip install sentence-transformers\n"
-            "or install all project deps:\n"
-            "  pip install -r requirements.txt\n"
-            "Alternatively: run this script on a machine that already has it, then copy "
-            "topic_embeddings.json to this server next to main.py."
+            "  python -m pip install sentence-transformers\n"
+            "or:  python -m pip install -r requirements.txt\n"
+            "Or run this script on your laptop and copy topic_embeddings.json here.\n"
+            f"{extra}"
         ) from None
 
     root = Path(__file__).resolve().parent.parent
