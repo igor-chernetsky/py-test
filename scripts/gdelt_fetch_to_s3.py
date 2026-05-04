@@ -11,13 +11,20 @@ Example:
   python scripts/gdelt_fetch_to_s3.py
   python scripts/gdelt_fetch_to_s3.py --query "ukraine" --maxrecords 100
   S3_BUCKET=my-bucket python scripts/gdelt_fetch_to_s3.py
+
+Rate limits: GDELT may return HTTP 429. This script retries with backoff (429/502/503).
+Tune with GDELT_MAX_ATTEMPTS, GDELT_RETRY_BASE_SEC, GDELT_RETRY_CAP_SEC, or CLI flags.
+Use `flock` in cron so two fetchers never overlap. If logs still show `query=global+climate`,
+update the server repo or unset legacy GDELT_QUERY so the default positive-tone query is used.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,13 +52,69 @@ def build_gdelt_url(query: str, maxrecords: int, timespan: str) -> str:
     return f"{GDELT_DOC_BASE}?{urllib.parse.urlencode(params)}"
 
 
-def fetch_gdelt(url: str, timeout: int = 120) -> bytes:
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "gdelt-fetch-to-s3/1.0 (learning script)"},
+RETRYABLE_HTTP = {429, 502, 503}
+
+
+def _retry_after_seconds(err: urllib.error.HTTPError, cap: float) -> float | None:
+    raw = err.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return min(float(raw), cap)
+    except ValueError:
+        return None
+
+
+def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
+    """attempt is 0-based index of the next sleep (after failure)."""
+    return min(base * (2**attempt), cap)
+
+
+def fetch_gdelt(
+    url: str,
+    *,
+    timeout: int = 120,
+    max_attempts: int = 6,
+    retry_base_sec: float = 60.0,
+    retry_cap_sec: float = 900.0,
+) -> bytes:
+    """
+    Fetch with retries on rate limit / transient errors.
+    GDELT often returns 429; use env GDELT_MAX_ATTEMPTS, GDELT_RETRY_BASE_SEC, GDELT_RETRY_CAP_SEC to tune.
+    """
+    ua = os.environ.get(
+        "GDELT_USER_AGENT",
+        "gdelt-fetch-to-s3/1.1 (+https://github.com/)",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(url, headers={"User-Agent": ua})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRYABLE_HTTP or attempt >= max_attempts - 1:
+                raise
+            delay = _retry_after_seconds(e, retry_cap_sec)
+            if delay is None:
+                delay = _backoff_seconds(attempt, retry_base_sec, retry_cap_sec)
+            delay += random.uniform(5.0, 35.0)
+            print(
+                f"GDELT HTTP {e.code}: retry in {delay:.0f}s (attempt {attempt + 2}/{max_attempts})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+        except urllib.error.URLError as e:
+            if attempt >= max_attempts - 1:
+                raise
+            delay = _backoff_seconds(attempt, retry_base_sec, retry_cap_sec) + random.uniform(5.0, 25.0)
+            print(
+                f"GDELT network error ({e.reason!s}): retry in {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("fetch_gdelt: exhausted retries without return")  # pragma: no cover
 
 
 def upload_to_s3(bucket: str, key: str, body: bytes, content_type: str = "application/json") -> None:
@@ -100,13 +163,36 @@ def main() -> int:
         action="store_true",
         help="Fetch only, print size and URL; do not upload to S3",
     )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=int(os.environ.get("GDELT_MAX_ATTEMPTS", "6")),
+        help="HTTP retries for 429/502/503 (default: env GDELT_MAX_ATTEMPTS or 6)",
+    )
+    parser.add_argument(
+        "--retry-base-sec",
+        type=float,
+        default=float(os.environ.get("GDELT_RETRY_BASE_SEC", "60")),
+        help="Base backoff seconds before jitter (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-cap-sec",
+        type=float,
+        default=float(os.environ.get("GDELT_RETRY_CAP_SEC", "900")),
+        help="Max wait per retry (default: 900)",
+    )
     args = parser.parse_args()
 
     url = build_gdelt_url(args.query, args.maxrecords, args.timespan)
     print(f"Fetching: {url}")
 
     try:
-        body = fetch_gdelt(url)
+        body = fetch_gdelt(
+            url,
+            max_attempts=max(1, args.max_attempts),
+            retry_base_sec=args.retry_base_sec,
+            retry_cap_sec=args.retry_cap_sec,
+        )
     except urllib.error.HTTPError as e:
         print(f"GDELT HTTP error: {e.code} {e.reason}", file=sys.stderr)
         return 1
