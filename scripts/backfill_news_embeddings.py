@@ -10,14 +10,25 @@ Run from project root:
   python scripts/backfill_news_embeddings.py
   python scripts/backfill_news_embeddings.py --limit 100
   python scripts/backfill_news_embeddings.py --dry-run
+
+Small instances: use --batch-size 4 --commit-each-row; if the box reboots or the process vanishes,
+the kernel likely OOM-killed it (PyTorch + model needs RAM). Add swap, use a larger instance, or
+run this script on your laptop with RDS reachable (security group / VPN).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+# Before heavy libs: reduce thread pool memory on small EC2
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
 import psycopg2
@@ -85,9 +96,19 @@ def fetch_null_batch(cur, *, after_id: int, batch_size: int) -> list[dict[str, A
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill news_articles.embedding where NULL")
-    parser.add_argument("--batch-size", type=int, default=64, help="Rows per encode + UPDATE batch")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Rows per encode batch (lower = less RAM; try 4 on t3.micro)",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Max rows to update (0 = all NULL rows)")
     parser.add_argument("--dry-run", action="store_true", help="Show counts / first batch only, no writes")
+    parser.add_argument(
+        "--commit-each-row",
+        action="store_true",
+        help="COMMIT after each UPDATE (slower; survives partial runs and shows steady progress)",
+    )
     args = parser.parse_args()
 
     try:
@@ -122,8 +143,12 @@ def main() -> int:
         "Wait until you see 'Updated …' lines…",
         flush=True,
     )
+    t0 = time.perf_counter()
     model = get_embed_model()
-    print("Model ready. Encoding and updating…", flush=True)
+    print(f"Model loaded in {time.perf_counter() - t0:.1f}s. Running warmup encode…", flush=True)
+    t1 = time.perf_counter()
+    texts_to_vector_literals(["warmup"], model)
+    print(f"Warmup OK ({time.perf_counter() - t1:.1f}s). Writing DB…", flush=True)
     updated = 0
     last_id = 0
     target_cap = args.limit if args.limit > 0 else None
@@ -164,9 +189,17 @@ def main() -> int:
                         """,
                         (lit, row_id),
                     )
-            conn.commit()
-            updated += len(ids)
-            print(f"Updated {updated} row(s) (last id={last_id})...")
+                    if args.commit_each_row:
+                        conn.commit()
+                        updated += 1
+                        print(
+                            f"  committed id={row_id}  ({updated}/{total_null} with NULL embedding)",
+                            flush=True,
+                        )
+            if not args.commit_each_row:
+                conn.commit()
+                updated += len(ids)
+                print(f"Updated {updated} row(s) (last id={last_id})...", flush=True)
     except Exception:
         conn.rollback()
         raise
