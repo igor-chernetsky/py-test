@@ -88,9 +88,14 @@ def get_topic_vector_literals() -> dict[str, str]:
 
 # Phrases the older visor sent as `topic=` before switching to slugs.
 _LEGACY_TOPIC_PHRASE_TO_SLUG: dict[str, str] = {
-    "climate change environment energy sustainability": "climate",
-    "technology software artificial intelligence computing": "technology",
-    "health medicine public health disease healthcare": "health",
+    "nature environment wildlife biodiversity climate earth": "nature",
+    "world international global countries diplomacy events": "world",
+    "science research discovery innovation technology space": "science",
+    "family parenting relationships children home wellbeing": "family",
+    # backward compatibility with older topic values
+    "climate change environment energy sustainability": "nature",
+    "technology software artificial intelligence computing": "science",
+    "health medicine public health disease healthcare": "family",
 }
 
 
@@ -227,7 +232,7 @@ def list_news(
     topic: str | None = Query(
         default=None,
         description=(
-            "Topic slug (climate, technology, health): rank by pgvector similarity using "
+            "Topic slug (nature, world, science, family): rank by pgvector similarity using "
             "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding."
         ),
     ),
@@ -264,7 +269,7 @@ def list_news(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Unknown topic. Use one of: climate, technology, health "
+                    "Unknown topic. Use one of: nature, world, science, family "
                     "(or redeploy with matching topic_embeddings.json)."
                 ),
             )

@@ -28,6 +28,9 @@ import boto3
 GDELT_DOC_BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
+DEFAULT_QUERY = (
+    '(tone>0) AND (nature OR environment OR "world news" OR international OR science OR family)'
+)
 
 
 def build_gdelt_url(query: str, maxrecords: int, timespan: str) -> str:
@@ -75,8 +78,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--query",
-        default=os.environ.get("GDELT_QUERY", "global climate"),
-        help='GDELT search query (default: env GDELT_QUERY or "global climate")',
+        default=os.environ.get("GDELT_QUERY", DEFAULT_QUERY),
+        help=(
+            "GDELT search query (default: env GDELT_QUERY or positive-tone "
+            "nature/world/science/family query)"
+        ),
     )
     parser.add_argument(
         "--maxrecords",
