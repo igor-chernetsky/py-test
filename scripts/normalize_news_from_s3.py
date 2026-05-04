@@ -21,6 +21,9 @@ Run after create_news_tables.py:
 
 create_news_tables adds a partial unique index on (normalized title, language, domain) and deletes
 existing duplicates (newest row kept). normalize repeats dedupe by default before ingesting S3.
+
+To fill embedding for rows already in DB (e.g. after ingesting with --no-embed), run:
+  python scripts/backfill_news_embeddings.py
 """
 
 from __future__ import annotations
