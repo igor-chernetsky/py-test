@@ -27,15 +27,17 @@ api_router = APIRouter(prefix="/api")
 logger = logging.getLogger("healthcheck.db")
 
 
-def _load_topic_vector_literals() -> dict[str, str]:
+def _topic_embeddings_path() -> Path:
     """
-    Precomputed all-MiniLM-L6-v2 vectors (384-dim, L2-normalized) for home-page topic chips.
-    Built by scripts/export_topic_embeddings.py — avoids sentence-transformers/torch on the API host.
+    JSON path: TOPIC_EMBEDDINGS_PATH env (absolute or relative to cwd), else next to this file.
     """
-    path = Path(__file__).resolve().parent / "topic_embeddings.json"
-    if not path.is_file():
-        logger.warning("topic_embeddings.json not found next to main.py; topic= search disabled")
-        return {}
+    override = os.getenv("TOPIC_EMBEDDINGS_PATH", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path(__file__).resolve().parent / "topic_embeddings.json").resolve()
+
+
+def _read_topic_vector_literals(path: Path) -> dict[str, str]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     out: dict[str, str] = {}
     for slug, arr in raw.items():
@@ -45,7 +47,44 @@ def _load_topic_vector_literals() -> dict[str, str]:
     return out
 
 
-TOPIC_VECTOR_LITERALS: dict[str, str] = _load_topic_vector_literals()
+_topic_file_mtime: float | None = None
+_topic_vector_literals_cache: dict[str, str] = {}
+
+
+def get_topic_vector_literals() -> dict[str, str]:
+    """
+    Cached read of topic_embeddings.json; reloads when the file's mtime changes.
+    Avoids empty topic maps when the file is added after the process starts or the service cwd differs.
+    """
+    global _topic_file_mtime, _topic_vector_literals_cache
+    path = _topic_embeddings_path()
+    if not path.is_file():
+        if _topic_vector_literals_cache:
+            logger.warning("topic embeddings file disappeared, clearing cache: %s", path)
+            _topic_vector_literals_cache = {}
+        elif _topic_file_mtime is None:
+            logger.warning(
+                "topic_embeddings.json not found at %s (set TOPIC_EMBEDDINGS_PATH if it lives elsewhere)",
+                path,
+            )
+        _topic_file_mtime = -1.0
+        return {}
+    mtime = path.stat().st_mtime
+    if _topic_vector_literals_cache and mtime == _topic_file_mtime:
+        return _topic_vector_literals_cache
+    try:
+        _topic_vector_literals_cache = _read_topic_vector_literals(path)
+        _topic_file_mtime = mtime
+        logger.info(
+            "Loaded topic embeddings: %s (%d topic(s))",
+            path,
+            len(_topic_vector_literals_cache),
+        )
+    except Exception:
+        logger.exception("Failed to parse topic embeddings: %s", path)
+        _topic_vector_literals_cache = {}
+    return _topic_vector_literals_cache
+
 
 # Phrases the older visor sent as `topic=` before switching to slugs.
 _LEGACY_TOPIC_PHRASE_TO_SLUG: dict[str, str] = {
@@ -56,16 +95,17 @@ _LEGACY_TOPIC_PHRASE_TO_SLUG: dict[str, str] = {
 
 
 def _resolve_topic_vector_literal(topic_param: str) -> str | None:
-    if not TOPIC_VECTOR_LITERALS:
+    literals = get_topic_vector_literals()
+    if not literals:
         return None
     key = " ".join(topic_param.strip().lower().replace("+", " ").split())
     if not key:
         return None
-    if key in TOPIC_VECTOR_LITERALS:
-        return TOPIC_VECTOR_LITERALS[key]
+    if key in literals:
+        return literals[key]
     slug = _LEGACY_TOPIC_PHRASE_TO_SLUG.get(key)
-    if slug and slug in TOPIC_VECTOR_LITERALS:
-        return TOPIC_VECTOR_LITERALS[slug]
+    if slug and slug in literals:
+        return literals[slug]
     return None
 
 
@@ -211,10 +251,15 @@ def list_news(
     if use_vector:
         vec_lit = _resolve_topic_vector_literal(topic_clean)
         if vec_lit is None:
-            if not TOPIC_VECTOR_LITERALS:
+            if not get_topic_vector_literals():
+                p = _topic_embeddings_path()
                 raise HTTPException(
                     status_code=503,
-                    detail="Topic search is not configured (missing topic_embeddings.json on server).",
+                    detail=(
+                        "Topic search is not configured: no topic embeddings loaded. "
+                        f"Expected file at {p} (override with TOPIC_EMBEDDINGS_PATH). "
+                        "Restart the API after adding the file."
+                    ),
                 )
             raise HTTPException(
                 status_code=400,

@@ -17,6 +17,10 @@ Run after create_news_tables.py:
   python scripts/normalize_news_from_s3.py
   python scripts/normalize_news_from_s3.py --limit 10
   python scripts/normalize_news_from_s3.py --no-embed   # skip sentence-transformers (no vector fill)
+  python scripts/normalize_news_from_s3.py --no-dedupe # skip DB dedupe step at startup
+
+create_news_tables adds a partial unique index on (normalized title, language, domain) and deletes
+existing duplicates (newest row kept). normalize repeats dedupe by default before ingesting S3.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from psycopg2 import errors as pg_errors
 from psycopg2.extras import Json
 
 from pg_env import connect_pg
@@ -96,23 +101,59 @@ def vector_literal_from_text(text: str, no_embed: bool) -> str | None:
     return "[" + ",".join(str(float(x)) for x in vec.tolist()) + "]"
 
 
-def title_taken_by_other_url(cur, title: str | None, url: str) -> bool:
-    """True if another row already has this title (btrim, case-insensitive)."""
+def article_key_taken_by_other_url(
+    cur,
+    title: str | None,
+    domain: str | None,
+    language: str | None,
+    url: str,
+) -> bool:
+    """True if another row already has the same (title, language, domain) key (matches DB unique index)."""
     t = (title or "").strip()
     if not t:
         return False
     u = url.strip()
+    d = (domain or "").strip() or None
+    lang = (language or "").strip() or None
     cur.execute(
         """
         SELECT 1 FROM news_articles
         WHERE lower(btrim(COALESCE(title, ''))) = lower(btrim(COALESCE(%s, '')))
           AND length(btrim(COALESCE(%s, ''))) > 0
+          AND COALESCE(language, '') = COALESCE(%s::text, '')
+          AND COALESCE(domain, '') = COALESCE(%s::text, '')
           AND url <> %s
         LIMIT 1
         """,
-        (t, t, u),
+        (t, t, lang, d, u),
     )
     return cur.fetchone() is not None
+
+
+DEDUPE_BY_TITLE_LANG_DOMAIN = """
+DELETE FROM news_articles
+WHERE id IN (
+    SELECT id FROM (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY lower(btrim(COALESCE(title, ''))),
+                                COALESCE(language, ''),
+                                COALESCE(domain, '')
+                   ORDER BY created_at DESC NULLS LAST, id DESC
+               ) AS rn
+        FROM news_articles
+        WHERE length(btrim(COALESCE(title, ''))) > 0
+    ) sub
+    WHERE rn > 1
+);
+"""
+
+
+def dedupe_news_articles_by_title_lang_domain(conn) -> int:
+    """Drop duplicate rows; keep the newest (created_at, id) per (title, language, domain)."""
+    with conn.cursor() as cur:
+        cur.execute(DEDUPE_BY_TITLE_LANG_DOMAIN)
+        return cur.rowcount
 
 
 def _pick(d: dict[str, Any], *keys: str) -> Any:
@@ -280,15 +321,20 @@ def process_object(
                 {k: v for k, v in row.items() if k not in ("url", "URL")} or None
             )
 
-            if title_taken_by_other_url(cur, title, url):
+            domain = tup[3]
+            language = tup[4]
+            if article_key_taken_by_other_url(cur, title, domain, language, url):
                 continue
 
-            if no_embed:
-                cur.execute(sql, tup)
-            else:
-                emb_text = build_embedding_text(title, snippet_dict)
-                vec_lit = vector_literal_from_text(emb_text, no_embed=False)
-                cur.execute(sql, (*tup, vec_lit))
+            try:
+                if no_embed:
+                    cur.execute(sql, tup)
+                else:
+                    emb_text = build_embedding_text(title, snippet_dict)
+                    vec_lit = vector_literal_from_text(emb_text, no_embed=False)
+                    cur.execute(sql, (*tup, vec_lit))
+            except pg_errors.UniqueViolation:
+                continue
             count += 1
         cur.execute(
             UPSERT_INGEST,
@@ -320,6 +366,11 @@ def main() -> int:
         action="store_true",
         help="Do not load sentence-transformers or write embedding (column must allow NULL or omit in SQL)",
     )
+    parser.add_argument(
+        "--no-dedupe",
+        action="store_true",
+        help="Skip DELETE of duplicate rows (same title+language+domain) before processing S3",
+    )
     args = parser.parse_args()
 
     prefix = args.prefix.rstrip("/") + "/"
@@ -344,6 +395,14 @@ def main() -> int:
 
     completed = load_completed_keys(conn, bucket)
     conn.commit()
+
+    if not args.no_dedupe:
+        removed = dedupe_news_articles_by_title_lang_domain(conn)
+        conn.commit()
+        if removed:
+            print(
+                f"Deduped DB: removed {removed} row(s) with duplicate title+language+domain (kept newest)."
+            )
 
     pending = [item for item in keys if item["Key"] not in completed]
     if args.limit:

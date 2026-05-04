@@ -20,3 +20,5 @@ grep "Normalization" /home/ec2-user/py-test/logs/normalizer.log | tail -5
 
 # check last 10 normalizations
 grep "finished at" /home/ec2-user/py-test/logs/normalizer.log | tail -10
+
+# db connect psql "host=database-1.cpycqqk6qhjv.eu-north-1.rds.amazonaws.com port=5432 dbname=postgres user=postgres sslmode=require"
