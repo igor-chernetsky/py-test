@@ -3,7 +3,8 @@
 Set news_articles.embedding for rows where it is NULL (same model/text rules as normalize_news_from_s3).
 
 Uses title + first snippet field from gdelt_snippet JSONB via build_embedding_text().
-Requires sentence-transformers + DB env (RDSHOST, RDSPASSWORD, etc.) like other scripts.
+Requires sentence-transformers in this venv (not needed for the FastAPI app) plus DB env
+(RDSHOST, RDSPASSWORD, etc.):  python -m pip install sentence-transformers
 
 Run from project root:
   python scripts/backfill_news_embeddings.py
@@ -33,6 +34,18 @@ from normalize_news_from_s3 import (  # noqa: E402
     get_embed_model,
 )
 from pg_env import connect_pg  # noqa: E402
+
+
+def _require_sentence_transformers() -> None:
+    try:
+        import sentence_transformers  # noqa: F401
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "sentence-transformers is not installed. This script encodes text; the API does not need it.\n"
+            "  python -m pip install sentence-transformers\n"
+            "or:  python -m pip install -r requirements.txt\n"
+            "Then re-run this script."
+        ) from None
 
 
 def texts_to_vector_literals(texts: list[str], model) -> list[str]:
@@ -103,7 +116,14 @@ def main() -> int:
         print("Dry run: no updates.")
         return 0
 
+    _require_sentence_transformers()
+    print(
+        "Loading embedding model (downloads ~100MB on first run; CPU encode can take a few minutes). "
+        "Wait until you see 'Updated …' lines…",
+        flush=True,
+    )
     model = get_embed_model()
+    print("Model ready. Encoding and updating…", flush=True)
     updated = 0
     last_id = 0
     target_cap = args.limit if args.limit > 0 else None
