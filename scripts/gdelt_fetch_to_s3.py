@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -102,7 +103,45 @@ def _iso_to_seendate(value: object) -> str | None:
     return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
-def _story_to_article(story: dict[str, object]) -> dict[str, object] | None:
+def _fetch_og_image(url: str, timeout: int = 10) -> str | None:
+    """
+    Best-effort extraction of og:image/twitter:image from article HTML.
+    Keeps payload quality high when upstream API doesn't provide image fields.
+    """
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "news-image-enricher/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" not in ct and "application/xhtml" not in ct:
+                return None
+            raw = resp.read(300_000)
+    except Exception:
+        return None
+
+    html = raw.decode("utf-8", errors="ignore")
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+    ]
+    for p in patterns:
+        m = re.search(p, html, flags=re.IGNORECASE)
+        if not m:
+            continue
+        candidate = m.group(1).strip()
+        if candidate:
+            return urllib.parse.urljoin(url, candidate)
+    return None
+
+
+def _story_to_article(story: dict[str, object], *, enrich_images: bool) -> dict[str, object] | None:
     source_url = story.get("sourceUrl")
     if not isinstance(source_url, str) or not source_url.strip():
         return None
@@ -118,6 +157,10 @@ def _story_to_article(story: dict[str, object]) -> dict[str, object] | None:
     elif isinstance(feed, dict) and isinstance(feed.get("issue"), dict) and isinstance(feed["issue"].get("name"), str):
         issue_name = feed["issue"]["name"]
 
+    social_image = story.get("socialImage") or story.get("imageUrl") or story.get("thumbnail")
+    if (not social_image or not str(social_image).strip()) and enrich_images:
+        social_image = _fetch_og_image(source_url)
+
     out: dict[str, object] = {
         "url": source_url,
         "title": title.strip() if isinstance(title, str) and title.strip() else None,
@@ -125,7 +168,7 @@ def _story_to_article(story: dict[str, object]) -> dict[str, object] | None:
         "domain": hostname,
         "language": "English",
         "sourcecountry": None,
-        "socialimage": story.get("socialImage") or story.get("imageUrl") or story.get("thumbnail"),
+        "socialimage": social_image,
         "summary": story.get("summary"),
         "quote": story.get("quote"),
         "emotionTag": story.get("emotionTag"),
@@ -137,7 +180,7 @@ def _story_to_article(story: dict[str, object]) -> dict[str, object] | None:
     return out
 
 
-def transform_source_payload(raw_body: bytes) -> tuple[dict[str, object] | None, str]:
+def transform_source_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
     """
     Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
     """
@@ -165,7 +208,7 @@ def transform_source_payload(raw_body: bytes) -> tuple[dict[str, object] | None,
     for row in rows:
         if not isinstance(row, dict):
             continue
-        article = _story_to_article(row)
+        article = _story_to_article(row, enrich_images=enrich_images)
         if article is not None:
             articles.append(article)
 
@@ -330,6 +373,11 @@ def main() -> int:
         action="store_true",
         help="Upload invalid API payloads under <prefix>invalid/ for debugging",
     )
+    parser.add_argument(
+        "--enrich-images",
+        action="store_true",
+        help="When source API has no image, try extracting og:image from article pages (slower)",
+    )
     args = parser.parse_args()
 
     url = build_source_url(args.query, args.maxrecords, args.api_base)
@@ -350,7 +398,7 @@ def main() -> int:
         return 1
 
     print(f"Downloaded {len(raw_body)} bytes")
-    converted, convert_err = transform_source_payload(raw_body)
+    converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
     if converted is None:
         print(f"Source payload rejected: {convert_err}", file=sys.stderr)
         if args.save_invalid_to_s3:
