@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -93,15 +94,22 @@ def vector_literal_from_text(text: str, no_embed: bool) -> str | None:
     if no_embed:
         return None
     model = get_embed_model()
-    vec = model.encode(text[:5000], normalize=True, show_progress_bar=False)
-    dim = int(vec.shape[0]) if hasattr(vec, "shape") else len(vec)
+    raw = model.encode(text[:5000], show_progress_bar=False)
+    vec = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+    # Keep cosine-compatible behavior regardless of sentence-transformers encode() kwargs support.
+    norm = math.sqrt(sum(float(x) * float(x) for x in vec))
+    if norm > 0:
+        vec = [float(x) / norm for x in vec]
+    else:
+        vec = [float(x) for x in vec]
+    dim = len(vec)
     expected = embedding_dim_expected()
     if dim != expected:
         raise RuntimeError(
             f"Model embedding dim is {dim} but EMBEDDING_DIM / DB column expect {expected}. "
             "Set EMBEDDING_MODEL / EMBEDDING_DIM to match create_news_tables.py vector(N)."
         )
-    return "[" + ",".join(str(float(x)) for x in vec.tolist()) + "]"
+    return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
 
 def article_key_taken_by_other_url(
