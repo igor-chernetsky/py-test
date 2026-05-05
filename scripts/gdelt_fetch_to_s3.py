@@ -71,6 +71,26 @@ def _backoff_seconds(attempt: int, base: float, cap: float) -> float:
     return min(base * (2**attempt), cap)
 
 
+def _looks_like_rate_limited_body(body: bytes) -> bool:
+    """
+    GDELT may occasionally return short plain-text/html anti-abuse pages with HTTP 200.
+    Treat obvious rate-limit bodies as transient and retry.
+    """
+    if len(body) > 4096:
+        return False
+    text = body.decode("utf-8", errors="ignore").lower()
+    signals = (
+        "too many requests",
+        "rate limit",
+        "429",
+        "access denied",
+        "temporarily unavailable",
+        "service unavailable",
+        "<html",
+    )
+    return any(s in text for s in signals)
+
+
 def fetch_gdelt(
     url: str,
     *,
@@ -91,7 +111,20 @@ def fetch_gdelt(
         req = urllib.request.Request(url, headers={"User-Agent": ua})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read()
+                body = resp.read()
+                if _looks_like_rate_limited_body(body):
+                    if attempt >= max_attempts - 1:
+                        return body
+                    delay = _backoff_seconds(attempt, retry_base_sec, retry_cap_sec) + random.uniform(5.0, 35.0)
+                    print(
+                        f"GDELT returned non-JSON rate-limit body: retry in {delay:.0f}s "
+                        f"(attempt {attempt + 2}/{max_attempts})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                return body
         except urllib.error.HTTPError as e:
             if e.code not in RETRYABLE_HTTP or attempt >= max_attempts - 1:
                 raise
