@@ -31,12 +31,11 @@ from datetime import datetime, timezone
 
 import boto3
 
-AR_API_BASE = "https://actuallyrelevant.news/api"
+AR_API_BASE = "https://actually-relevant-api.onrender.com/api"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
-DEFAULT_QUERY = (
-    '(tone>0) AND (nature OR environment OR "world news" OR international OR science OR family)'
-)
+# NOTE: This is plain-text search for Actually Relevant, not GDELT boolean syntax.
+DEFAULT_QUERY = "nature world science family"
 
 
 def build_source_url(query: str, maxrecords: int, api_base: str) -> str:
@@ -142,8 +141,15 @@ def transform_source_payload(raw_body: bytes) -> tuple[dict[str, object] | None,
     """
     Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
     """
+    text = raw_body.decode("utf-8", errors="replace")
+    if "<!doctype html" in text.lower() or "<html" in text.lower():
+        return (
+            None,
+            "received HTML instead of JSON (likely frontend host). "
+            "Use --api-base https://actually-relevant-api.onrender.com/api",
+        )
     try:
-        src = json.loads(raw_body.decode("utf-8"))
+        src = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         return None, f"invalid json: {e}"
 
@@ -272,8 +278,9 @@ def main() -> int:
         "--query",
         default=os.environ.get("GDELT_QUERY", DEFAULT_QUERY),
         help=(
-            "Search query for Actually Relevant stories endpoint "
-            "(default: env GDELT_QUERY or positive-tone nature/world/science/family query)"
+            "Plain-text search query for Actually Relevant stories endpoint "
+            "(default: env GDELT_QUERY or 'nature world science family'). "
+            "Do not use GDELT boolean syntax here."
         ),
     )
     parser.add_argument(
@@ -290,7 +297,10 @@ def main() -> int:
     parser.add_argument(
         "--api-base",
         default=os.environ.get("AR_API_BASE", AR_API_BASE),
-        help="Actually Relevant API base URL (default: env AR_API_BASE or https://actuallyrelevant.news/api)",
+        help=(
+            "Actually Relevant API base URL "
+            "(default: env AR_API_BASE or https://actually-relevant-api.onrender.com/api)"
+        ),
     )
     parser.add_argument(
         "--dry-run",
