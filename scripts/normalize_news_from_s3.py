@@ -90,6 +90,86 @@ def build_embedding_text(title: str | None, snippet: dict[str, Any] | None) -> s
     return text if text else "news article"
 
 
+def _truthy_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def is_positive_candidate(title: str | None, snippet: dict[str, Any] | None) -> bool:
+    """
+    Conservative positivity guardrail:
+    - Prefer explicit emotion/sentiment/tone fields when available.
+    - Fallback to lightweight lexical heuristics over title+summary.
+    """
+    if snippet:
+        emotion = snippet.get("emotionTag")
+        if isinstance(emotion, str):
+            tag = emotion.strip().lower()
+            if tag in ("scary", "frustrating", "angry", "sad", "fearful"):
+                return False
+            if tag in ("uplifting", "calm", "hopeful", "positive", "optimistic"):
+                return True
+
+        for key in ("sentiment", "tone", "sentimentScore", "sentiment_score"):
+            val = snippet.get(key)
+            if isinstance(val, (int, float)):
+                return float(val) > 0
+            if isinstance(val, str):
+                s = val.strip().lower()
+                if s in ("negative", "neg", "bad"):
+                    return False
+                if s in ("positive", "pos", "good"):
+                    return True
+
+    text_parts: list[str] = []
+    if title and title.strip():
+        text_parts.append(title.strip())
+    if snippet:
+        for key in ("summary", "description", "snippet", "quote", "context"):
+            v = snippet.get(key) or snippet.get(key.capitalize())
+            if isinstance(v, str) and v.strip():
+                text_parts.append(v.strip())
+                break
+    text = " ".join(text_parts).lower()
+    if not text:
+        return True
+
+    positive_hints = (
+        "improve",
+        "improved",
+        "breakthrough",
+        "recovery",
+        "cooperation",
+        "peace",
+        "progress",
+        "hope",
+        "success",
+        "support",
+        "growth",
+        "innovation",
+    )
+    negative_hints = (
+        "killed",
+        "dead",
+        "war",
+        "attack",
+        "crisis",
+        "disaster",
+        "violence",
+        "threat",
+        "collapse",
+        "outbreak",
+        "flood",
+        "earthquake",
+        "shooting",
+    )
+    pos = sum(1 for w in positive_hints if w in text)
+    neg = sum(1 for w in negative_hints if w in text)
+    return neg <= pos
+
+
 def vector_literal_from_text(text: str, no_embed: bool) -> str | None:
     if no_embed:
         return None
@@ -304,6 +384,7 @@ def process_object(
     etag: str | None,
     *,
     no_embed: bool,
+    positive_only: bool,
 ) -> tuple[int, str | None]:
     body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     try:
@@ -331,6 +412,8 @@ def process_object(
             snippet_dict: dict[str, Any] | None = (
                 {k: v for k, v in row.items() if k not in ("url", "URL")} or None
             )
+            if positive_only and not is_positive_candidate(title, snippet_dict):
+                continue
 
             domain = tup[3]
             language = tup[4]
@@ -382,6 +465,20 @@ def main() -> int:
         action="store_true",
         help="Skip DELETE of duplicate rows (same title+language+domain) before processing S3",
     )
+    positive_filter_default = _truthy_env("POSITIVE_ONLY", True)
+    parser.add_argument(
+        "--positive-only",
+        dest="positive_only",
+        action="store_true",
+        default=positive_filter_default,
+        help="Keep only positive/neutral-positive articles (default: POSITIVE_ONLY env or true)",
+    )
+    parser.add_argument(
+        "--no-positive-only",
+        dest="positive_only",
+        action="store_false",
+        help="Disable positivity filter and ingest all fetched articles",
+    )
     args = parser.parse_args()
 
     prefix = args.prefix.rstrip("/") + "/"
@@ -428,7 +525,15 @@ def main() -> int:
                 etag = etag.strip('"')
 
             try:
-                n, err = process_object(s3, conn, bucket, key, etag, no_embed=args.no_embed)
+                n, err = process_object(
+                    s3,
+                    conn,
+                    bucket,
+                    key,
+                    etag,
+                    no_embed=args.no_embed,
+                    positive_only=args.positive_only,
+                )
                 if err:
                     conn.rollback()
                     mark_failed(conn, bucket, key, etag, err)

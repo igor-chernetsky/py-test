@@ -114,6 +114,23 @@ def _resolve_topic_vector_literal(topic_param: str) -> str | None:
     return None
 
 
+def topic_max_distance() -> float:
+    """
+    Cosine distance cutoff for topic-filtered search (lower = stricter).
+    With normalized vectors, good matches are typically closer to 0.
+    """
+    raw = os.getenv("TOPIC_MAX_DISTANCE", "0.72").strip()
+    try:
+        val = float(raw)
+    except ValueError:
+        return 0.72
+    if val < 0:
+        return 0.0
+    if val > 2:
+        return 2.0
+    return val
+
+
 def get_db_status() -> str:
     """
     Check PostgreSQL connectivity using password auth.
@@ -233,7 +250,8 @@ def list_news(
         default=None,
         description=(
             "Topic slug (nature, world, science, family): rank by pgvector similarity using "
-            "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding."
+            "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding. "
+            "Also applies a similarity cutoff so non-relevant rows are excluded."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=500),
@@ -253,6 +271,7 @@ def list_news(
     topic_clean = (topic or "").strip()
     use_vector = bool(topic_clean)
     vec_lit: str | None = None
+    max_distance = topic_max_distance()
     if use_vector:
         vec_lit = _resolve_topic_vector_literal(topic_clean)
         if vec_lit is None:
@@ -343,10 +362,11 @@ def list_news(
             ) AS d
             CROSS JOIN (SELECT %s::vector AS qv) AS qvec
             WHERE d.embedding IS NOT NULL
+              AND (d.embedding <=> qvec.qv) <= %s
             ORDER BY d.embedding <=> qvec.qv ASC NULLS LAST
             LIMIT %s OFFSET %s
         """
-        values.extend([vec_lit, limit, offset])
+        values.extend([vec_lit, max_distance, limit, offset])
     else:
         sql = f"""
             SELECT
