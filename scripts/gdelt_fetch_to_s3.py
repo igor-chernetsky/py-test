@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fetch JSON from the public GDELT Doc API and upload it to S3.
+Fetch JSON from Actually Relevant API, convert to GDELT-like schema, upload to S3.
 
-GDELT Doc API (no API key): https://api.gdeltproject.org/api/v2/doc/doc
+Actually Relevant public API: /api/stories (no auth expected)
 
 Requires AWS credentials (env, profile, or EC2 instance role) with s3:PutObject
 on the target bucket.
@@ -12,10 +12,8 @@ Example:
   python scripts/gdelt_fetch_to_s3.py --query "ukraine" --maxrecords 100
   S3_BUCKET=my-bucket python scripts/gdelt_fetch_to_s3.py
 
-Rate limits: GDELT may return HTTP 429. This script retries with backoff (429/502/503).
-Tune with GDELT_MAX_ATTEMPTS, GDELT_RETRY_BASE_SEC, GDELT_RETRY_CAP_SEC, or CLI flags.
-Use `flock` in cron so two fetchers never overlap. If logs still show `query=global+climate`,
-update the server repo or unset legacy GDELT_QUERY so the default positive-tone query is used.
+Rate limits/transient upstream failures may happen; this script retries with backoff
+(HTTP 429/502/503 + short anti-bot body heuristics) and only uploads valid JSON payloads.
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-GDELT_DOC_BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
+AR_API_BASE = "https://actuallyrelevant.news/api"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 DEFAULT_QUERY = (
@@ -41,16 +39,15 @@ DEFAULT_QUERY = (
 )
 
 
-def build_gdelt_url(query: str, maxrecords: int, timespan: str) -> str:
+def build_source_url(query: str, maxrecords: int, api_base: str) -> str:
     params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "maxrecords": str(maxrecords),
-        "timespan": timespan,
-        "sort": "datedesc",
+        "page": "1",
+        "pageSize": str(maxrecords),
     }
-    return f"{GDELT_DOC_BASE}?{urllib.parse.urlencode(params)}"
+    q = (query or "").strip()
+    if q:
+        params["search"] = q
+    return f"{api_base.rstrip('/')}/stories?{urllib.parse.urlencode(params)}"
 
 
 RETRYABLE_HTTP = {429, 502, 503}
@@ -89,6 +86,88 @@ def _looks_like_rate_limited_body(body: bytes) -> bool:
         "<html",
     )
     return any(s in text for s in signals)
+
+
+def _iso_to_seendate(value: object) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _story_to_article(story: dict[str, object]) -> dict[str, object] | None:
+    source_url = story.get("sourceUrl")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+    source_url = source_url.strip()
+    title = story.get("title") if isinstance(story.get("title"), str) else story.get("sourceTitle")
+    seendate = _iso_to_seendate(story.get("datePublished")) or _iso_to_seendate(story.get("dateCrawled"))
+    hostname = urllib.parse.urlparse(source_url).hostname
+    feed = story.get("feed")
+    feed_title = feed.get("title") if isinstance(feed, dict) and isinstance(feed.get("title"), str) else None
+    issue_name = None
+    if isinstance(story.get("issue"), dict) and isinstance(story["issue"].get("name"), str):
+        issue_name = story["issue"]["name"]
+    elif isinstance(feed, dict) and isinstance(feed.get("issue"), dict) and isinstance(feed["issue"].get("name"), str):
+        issue_name = feed["issue"]["name"]
+
+    out: dict[str, object] = {
+        "url": source_url,
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "seendate": seendate,
+        "domain": hostname,
+        "language": "English",
+        "sourcecountry": None,
+        "socialimage": story.get("socialImage") or story.get("imageUrl") or story.get("thumbnail"),
+        "summary": story.get("summary"),
+        "quote": story.get("quote"),
+        "emotionTag": story.get("emotionTag"),
+        "relevance": story.get("relevance"),
+        "sourceTitle": story.get("sourceTitle"),
+        "issue": issue_name,
+        "feedTitle": feed_title,
+    }
+    return out
+
+
+def transform_source_payload(raw_body: bytes) -> tuple[dict[str, object] | None, str]:
+    """
+    Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
+    """
+    try:
+        src = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"invalid json: {e}"
+
+    rows: list[object]
+    if isinstance(src, dict) and isinstance(src.get("data"), list):
+        rows = src["data"]
+    elif isinstance(src, list):
+        rows = src
+    else:
+        return None, "unexpected source payload shape (expected object with data[] or array)"
+
+    articles: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        article = _story_to_article(row)
+        if article is not None:
+            articles.append(article)
+
+    return {
+        "provider": "actually_relevant",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "articles": articles,
+    }, ""
 
 
 def fetch_gdelt(
@@ -193,8 +272,8 @@ def main() -> int:
         "--query",
         default=os.environ.get("GDELT_QUERY", DEFAULT_QUERY),
         help=(
-            "GDELT search query (default: env GDELT_QUERY or positive-tone "
-            "nature/world/science/family query)"
+            "Search query for Actually Relevant stories endpoint "
+            "(default: env GDELT_QUERY or positive-tone nature/world/science/family query)"
         ),
     )
     parser.add_argument(
@@ -206,7 +285,12 @@ def main() -> int:
     parser.add_argument(
         "--timespan",
         default=os.environ.get("GDELT_TIMESPAN", "24h"),
-        help="GDELT timespan e.g. 24h, 7d (default: 24h)",
+        help="Deprecated (kept for backwards-compatible cron args); ignored for Actually Relevant API",
+    )
+    parser.add_argument(
+        "--api-base",
+        default=os.environ.get("AR_API_BASE", AR_API_BASE),
+        help="Actually Relevant API base URL (default: env AR_API_BASE or https://actuallyrelevant.news/api)",
     )
     parser.add_argument(
         "--dry-run",
@@ -238,11 +322,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    url = build_gdelt_url(args.query, args.maxrecords, args.timespan)
+    url = build_source_url(args.query, args.maxrecords, args.api_base)
     print(f"Fetching: {url}")
 
     try:
-        body = fetch_gdelt(
+        raw_body = fetch_gdelt(
             url,
             max_attempts=max(1, args.max_attempts),
             retry_base_sec=args.retry_base_sec,
@@ -255,16 +339,30 @@ def main() -> int:
         print(f"GDELT network error: {e.reason}", file=sys.stderr)
         return 1
 
-    print(f"Downloaded {len(body)} bytes")
-    ok, err = validate_gdelt_payload(body)
-    if not ok:
-        print(f"GDELT payload rejected: {err}", file=sys.stderr)
+    print(f"Downloaded {len(raw_body)} bytes")
+    converted, convert_err = transform_source_payload(raw_body)
+    if converted is None:
+        print(f"Source payload rejected: {convert_err}", file=sys.stderr)
         if args.save_invalid_to_s3:
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            bad_key = f"{args.prefix}invalid/{ts}_gdelt_invalid_payload.txt"
+            bad_key = f"{args.prefix}invalid/{ts}_source_invalid_payload.txt"
             print(f"Uploading rejected payload for debug: s3://{args.bucket}/{bad_key}", file=sys.stderr)
             try:
-                upload_to_s3(args.bucket, bad_key, body, content_type="text/plain")
+                upload_to_s3(args.bucket, bad_key, raw_body, content_type="text/plain")
+            except Exception as e:
+                print(f"Failed to upload rejected payload: {e}", file=sys.stderr)
+        return 1
+
+    body = json.dumps(converted, ensure_ascii=False).encode("utf-8")
+    ok, err = validate_gdelt_payload(body)
+    if not ok:
+        print(f"Converted payload rejected: {err}", file=sys.stderr)
+        if args.save_invalid_to_s3:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            bad_key = f"{args.prefix}invalid/{ts}_converted_invalid_payload.json"
+            print(f"Uploading rejected payload for debug: s3://{args.bucket}/{bad_key}", file=sys.stderr)
+            try:
+                upload_to_s3(args.bucket, bad_key, body, content_type="application/json")
             except Exception as e:
                 print(f"Failed to upload rejected payload: {e}", file=sys.stderr)
         return 1
