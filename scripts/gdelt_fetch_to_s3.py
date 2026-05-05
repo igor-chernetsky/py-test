@@ -21,6 +21,7 @@ update the server repo or unset legacy GDELT_QUERY so the default positive-tone 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -127,6 +128,22 @@ def upload_to_s3(bucket: str, key: str, body: bytes, content_type: str = "applic
     )
 
 
+def validate_gdelt_payload(body: bytes) -> tuple[bool, str]:
+    """Basic shape validation so we never upload HTML/error pages as .json."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return False, f"invalid json: {e}"
+    if not isinstance(data, dict):
+        return False, "top-level JSON is not an object"
+    articles = data.get("articles")
+    if articles is None:
+        return False, "missing top-level 'articles' key"
+    if not isinstance(articles, list):
+        return False, f"'articles' is not a list ({type(articles).__name__})"
+    return True, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="GDELT Doc API → S3")
     parser.add_argument(
@@ -181,6 +198,11 @@ def main() -> int:
         default=float(os.environ.get("GDELT_RETRY_CAP_SEC", "900")),
         help="Max wait per retry (default: 900)",
     )
+    parser.add_argument(
+        "--save-invalid-to-s3",
+        action="store_true",
+        help="Upload invalid API payloads under <prefix>invalid/ for debugging",
+    )
     args = parser.parse_args()
 
     url = build_gdelt_url(args.query, args.maxrecords, args.timespan)
@@ -201,6 +223,18 @@ def main() -> int:
         return 1
 
     print(f"Downloaded {len(body)} bytes")
+    ok, err = validate_gdelt_payload(body)
+    if not ok:
+        print(f"GDELT payload rejected: {err}", file=sys.stderr)
+        if args.save_invalid_to_s3:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            bad_key = f"{args.prefix}invalid/{ts}_gdelt_invalid_payload.txt"
+            print(f"Uploading rejected payload for debug: s3://{args.bucket}/{bad_key}", file=sys.stderr)
+            try:
+                upload_to_s3(args.bucket, bad_key, body, content_type="text/plain")
+            except Exception as e:
+                print(f"Failed to upload rejected payload: {e}", file=sys.stderr)
+        return 1
 
     if args.dry_run:
         print("Dry run — skipping S3 upload")
