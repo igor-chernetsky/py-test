@@ -23,3 +23,8 @@ grep "finished at" /home/ec2-user/py-test/logs/normalizer.log | tail -10
 
 # db connect 
 psql "host=database-1.cpycqqk6qhjv.eu-north-1.rds.amazonaws.com port=5432 dbname=postgres user=postgres sslmode=require"
+
+set -a
+source .env
+set +a
+python scripts/normalize_news_from_s3.py
