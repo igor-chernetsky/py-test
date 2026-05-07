@@ -33,13 +33,14 @@ from datetime import datetime, timezone
 import boto3
 
 AR_API_BASE = "https://actually-relevant-api.onrender.com/api"
+NEWSDATA_API_BASE = "https://newsdata.io/api/1"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 # NOTE: This is plain-text search for Actually Relevant, not GDELT boolean syntax.
 DEFAULT_QUERY = "nature world science family"
 
 
-def build_source_url(query: str, maxrecords: int, api_base: str) -> str:
+def build_ar_url(query: str, maxrecords: int, api_base: str) -> str:
     params = {
         "page": "1",
         "pageSize": str(maxrecords),
@@ -48,6 +49,26 @@ def build_source_url(query: str, maxrecords: int, api_base: str) -> str:
     if q:
         params["search"] = q
     return f"{api_base.rstrip('/')}/stories?{urllib.parse.urlencode(params)}"
+
+
+def build_newsdata_url(
+    query: str,
+    maxrecords: int,
+    api_base: str,
+    api_key: str,
+    language: str,
+) -> str:
+    # NewsData free plans often cap the page size; 50 is a safe default upper bound.
+    size = max(1, min(maxrecords, 50))
+    params = {
+        "apikey": api_key,
+        "language": language,
+        "size": str(size),
+    }
+    q = (query or "").strip()
+    if q:
+        params["q"] = q
+    return f"{api_base.rstrip('/')}/news?{urllib.parse.urlencode(params)}"
 
 
 RETRYABLE_HTTP = {429, 502, 503}
@@ -180,6 +201,54 @@ def _story_to_article(story: dict[str, object], *, enrich_images: bool) -> dict[
     return out
 
 
+def _newsdata_row_to_article(row: dict[str, object], *, enrich_images: bool) -> dict[str, object] | None:
+    source_url = row.get("link")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+    source_url = source_url.strip()
+
+    title = row.get("title")
+    pub_date = row.get("pubDate")
+    source_id = row.get("source_id")
+    source_priority = row.get("source_priority")
+    country = row.get("country")
+    category = row.get("category")
+    sentiment = row.get("sentiment")
+    sentiment_stats = row.get("sentiment_stats")
+
+    hostname = urllib.parse.urlparse(source_url).hostname
+    social_image = row.get("image_url")
+    if (not social_image or not str(social_image).strip()) and enrich_images:
+        social_image = _fetch_og_image(source_url)
+
+    source_country: str | None = None
+    if isinstance(country, list):
+        clean = [str(c).strip().upper() for c in country if str(c).strip()]
+        if clean:
+            source_country = clean[0]
+    elif isinstance(country, str) and country.strip():
+        source_country = country.strip().upper()
+
+    out: dict[str, object] = {
+        "url": source_url,
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "seendate": _iso_to_seendate(pub_date),
+        "domain": hostname or (source_id.strip() if isinstance(source_id, str) and source_id.strip() else None),
+        "language": "English",
+        "sourcecountry": source_country,
+        "socialimage": social_image,
+        "summary": row.get("description"),
+        "quote": None,
+        "emotionTag": sentiment if isinstance(sentiment, str) else None,
+        "relevance": source_priority,
+        "sourceTitle": row.get("source_name"),
+        "issue": ", ".join([str(c) for c in category]) if isinstance(category, list) else None,
+        "feedTitle": "NewsData",
+        "sentiment_stats": sentiment_stats,
+    }
+    return out
+
+
 def transform_source_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
     """
     Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
@@ -214,6 +283,40 @@ def transform_source_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[d
 
     return {
         "provider": "actually_relevant",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "articles": articles,
+    }, ""
+
+
+def transform_newsdata_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
+    text = raw_body.decode("utf-8", errors="replace")
+    if "<!doctype html" in text.lower() or "<html" in text.lower():
+        return None, "received HTML instead of JSON from NewsData API"
+    try:
+        src = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"invalid json: {e}"
+
+    if not isinstance(src, dict):
+        return None, "unexpected NewsData payload shape (top-level is not an object)"
+    status = src.get("status")
+    if isinstance(status, str) and status.lower() == "error":
+        return None, f"NewsData API error: {src.get('results') or src.get('message') or 'unknown error'}"
+
+    rows = src.get("results")
+    if not isinstance(rows, list):
+        return None, "unexpected NewsData payload shape (missing results[])"
+
+    articles: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        article = _newsdata_row_to_article(row, enrich_images=enrich_images)
+        if article is not None:
+            articles.append(article)
+
+    return {
+        "provider": "newsdata",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "articles": articles,
     }, ""
@@ -306,7 +409,7 @@ def validate_gdelt_payload(body: bytes) -> tuple[bool, str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="GDELT Doc API → S3")
+    parser = argparse.ArgumentParser(description="News source API -> S3")
     parser.add_argument(
         "--bucket",
         default=os.environ.get("S3_BUCKET", DEFAULT_BUCKET),
@@ -346,6 +449,27 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--source",
+        choices=["actually_relevant", "newsdata"],
+        default=os.environ.get("NEWS_SOURCE", "actually_relevant"),
+        help="Source provider to fetch from (default: env NEWS_SOURCE or actually_relevant)",
+    )
+    parser.add_argument(
+        "--newsdata-api-base",
+        default=os.environ.get("NEWSDATA_API_BASE", NEWSDATA_API_BASE),
+        help="NewsData API base URL (default: env NEWSDATA_API_BASE or https://newsdata.io/api/1)",
+    )
+    parser.add_argument(
+        "--newsdata-api-key",
+        default=os.environ.get("NEWSDATA_API_KEY", ""),
+        help="NewsData API key (default: env NEWSDATA_API_KEY)",
+    )
+    parser.add_argument(
+        "--newsdata-language",
+        default=os.environ.get("NEWSDATA_LANGUAGE", "en"),
+        help="NewsData language filter (default: env NEWSDATA_LANGUAGE or en)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch only, print size and URL; do not upload to S3",
@@ -380,7 +504,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    url = build_source_url(args.query, args.maxrecords, args.api_base)
+    if args.source == "newsdata":
+        api_key = (args.newsdata_api_key or "").strip()
+        if not api_key:
+            print("Missing NewsData API key: set NEWSDATA_API_KEY or pass --newsdata-api-key", file=sys.stderr)
+            return 1
+        url = build_newsdata_url(
+            args.query,
+            args.maxrecords,
+            args.newsdata_api_base,
+            api_key=api_key,
+            language=args.newsdata_language,
+        )
+    else:
+        url = build_ar_url(args.query, args.maxrecords, args.api_base)
     print(f"Fetching: {url}")
 
     try:
@@ -398,7 +535,10 @@ def main() -> int:
         return 1
 
     print(f"Downloaded {len(raw_body)} bytes")
-    converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
+    if args.source == "newsdata":
+        converted, convert_err = transform_newsdata_payload(raw_body, enrich_images=args.enrich_images)
+    else:
+        converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
     if converted is None:
         print(f"Source payload rejected: {convert_err}", file=sys.stderr)
         if args.save_invalid_to_s3:
