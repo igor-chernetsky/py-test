@@ -47,6 +47,65 @@ def _strip_html(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s).strip()
 
 
+def _extract_image_from_entry(entry: ET.Element) -> str | None:
+    # RSS enclosure
+    enc = entry.find("enclosure")
+    if enc is not None:
+        url = (enc.attrib.get("url") or "").strip()
+        ctype = (enc.attrib.get("type") or "").lower()
+        if url and ("image/" in ctype or not ctype):
+            return url
+
+    # media namespace candidates
+    for tag in ("{*}content", "{*}thumbnail"):
+        for node in entry.findall(tag):
+            url = (node.attrib.get("url") or "").strip()
+            medium = (node.attrib.get("medium") or "").lower()
+            if url and (medium in ("image", "") or tag.endswith("thumbnail")):
+                return url
+
+    # Sometimes image is embedded in summary/description HTML.
+    for tag in ("description", "{*}summary", "{*}content"):
+        txt = _text(entry.find(tag))
+        if not txt:
+            continue
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', txt, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def _fetch_og_image(url: str, timeout: int = 10) -> str | None:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "rss-image-enricher/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if "text/html" not in ct and "application/xhtml" not in ct:
+                return None
+            raw = resp.read(300_000)
+    except Exception:
+        return None
+
+    html = raw.decode("utf-8", errors="ignore")
+    patterns = [
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+    ]
+    for p in patterns:
+        m = re.search(p, html, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            return urllib.parse.urljoin(url, m.group(1).strip())
+    return None
+
+
 def _first_link_from_entry(entry: ET.Element) -> str | None:
     # RSS: <link>https://...</link>
     rss_link = _text(entry.find("link"))
@@ -72,7 +131,7 @@ def _source_country_from_host(host: str | None) -> str | None:
     return None
 
 
-def parse_feed(xml_bytes: bytes, feed_url: str) -> list[dict[str, object]]:
+def parse_feed(xml_bytes: bytes, feed_url: str, *, enrich_images: bool) -> list[dict[str, object]]:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -97,6 +156,9 @@ def parse_feed(xml_bytes: bytes, feed_url: str) -> list[dict[str, object]]:
             or _text(entry.find("{*}summary"))
             or _text(entry.find("{*}content"))
         )
+        social_image = _extract_image_from_entry(entry)
+        if (not social_image or not str(social_image).strip()) and enrich_images:
+            social_image = _fetch_og_image(link)
         if summary:
             summary = _strip_html(summary)[:1200]
         entry_host = urllib.parse.urlparse(link).hostname
@@ -109,7 +171,7 @@ def parse_feed(xml_bytes: bytes, feed_url: str) -> list[dict[str, object]]:
                 "domain": entry_host,
                 "language": "English",
                 "sourcecountry": source_country,
-                "socialimage": None,
+                "socialimage": social_image,
                 "summary": summary,
                 "quote": None,
                 "emotionTag": None,
@@ -155,6 +217,11 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout seconds")
     parser.add_argument("--max-per-feed", type=int, default=10, help="Max entries per feed")
+    parser.add_argument(
+        "--enrich-images",
+        action="store_true",
+        help="If feed has no image field, try to fetch og:image from article page (slower)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Fetch/parse only, do not upload")
     args = parser.parse_args()
 
@@ -168,7 +235,7 @@ def main() -> int:
         except Exception as e:
             print(f"Feed fetch failed: {feed_url}: {e}", file=sys.stderr)
             continue
-        parsed = parse_feed(body, feed_url)
+        parsed = parse_feed(body, feed_url, enrich_images=args.enrich_images)
         if args.max_per_feed > 0:
             parsed = parsed[: args.max_per_feed]
         print(f"Parsed {len(parsed)} items from {feed_url}")
