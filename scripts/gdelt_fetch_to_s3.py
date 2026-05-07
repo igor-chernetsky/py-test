@@ -34,6 +34,7 @@ import boto3
 
 AR_API_BASE = "https://actually-relevant-api.onrender.com/api"
 NEWSDATA_API_BASE = "https://newsdata.io/api/1"
+THENEWSAPI_BASE = "https://api.thenewsapi.com/v1/news/top"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 # NOTE: This is plain-text search for Actually Relevant, not GDELT boolean syntax.
@@ -69,6 +70,26 @@ def build_newsdata_url(
     if q:
         params["q"] = q
     return f"{api_base.rstrip('/')}/news?{urllib.parse.urlencode(params)}"
+
+
+def build_thenewsapi_url(
+    query: str,
+    maxrecords: int,
+    api_base: str,
+    api_token: str,
+    language: str,
+) -> str:
+    # Free plan: keep strict cap to avoid accidental over-limit usage.
+    limit = max(1, min(maxrecords, 3))
+    params = {
+        "api_token": api_token,
+        "language": language,
+        "limit": str(limit),
+    }
+    q = (query or "").strip()
+    if q:
+        params["search"] = q
+    return f"{api_base.rstrip('/')}?{urllib.parse.urlencode(params)}"
 
 
 RETRYABLE_HTTP = {429, 502, 503}
@@ -249,6 +270,46 @@ def _newsdata_row_to_article(row: dict[str, object], *, enrich_images: bool) -> 
     return out
 
 
+def _thenewsapi_row_to_article(row: dict[str, object], *, enrich_images: bool) -> dict[str, object] | None:
+    source_url = row.get("url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+    source_url = source_url.strip()
+
+    title = row.get("title")
+    pub_date = row.get("published_at")
+    source = row.get("source")
+    language = row.get("language")
+    categories = row.get("categories")
+
+    hostname = urllib.parse.urlparse(source_url).hostname
+    social_image = row.get("image_url")
+    if (not social_image or not str(social_image).strip()) and enrich_images:
+        social_image = _fetch_og_image(source_url)
+
+    source_country = None
+    if isinstance(row.get("locale"), str) and row["locale"].strip():
+        source_country = row["locale"].strip().upper()
+
+    out: dict[str, object] = {
+        "url": source_url,
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "seendate": _iso_to_seendate(pub_date),
+        "domain": hostname,
+        "language": str(language).strip().capitalize() if isinstance(language, str) and language.strip() else "English",
+        "sourcecountry": source_country,
+        "socialimage": social_image,
+        "summary": row.get("description") or row.get("snippet"),
+        "quote": row.get("snippet"),
+        "emotionTag": None,
+        "relevance": row.get("relevance_score"),
+        "sourceTitle": source if isinstance(source, str) else None,
+        "issue": ", ".join([str(c) for c in categories]) if isinstance(categories, list) else None,
+        "feedTitle": "TheNewsAPI",
+    }
+    return out
+
+
 def transform_source_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
     """
     Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
@@ -317,6 +378,40 @@ def transform_newsdata_payload(raw_body: bytes, *, enrich_images: bool) -> tuple
 
     return {
         "provider": "newsdata",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "articles": articles,
+    }, ""
+
+
+def transform_thenewsapi_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
+    text = raw_body.decode("utf-8", errors="replace")
+    if "<!doctype html" in text.lower() or "<html" in text.lower():
+        return None, "received HTML instead of JSON from TheNewsAPI"
+    try:
+        src = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"invalid json: {e}"
+
+    if not isinstance(src, dict):
+        return None, "unexpected TheNewsAPI payload shape (top-level is not an object)"
+
+    if src.get("error"):
+        return None, f"TheNewsAPI error: {src.get('message') or src.get('error')}"
+
+    rows = src.get("data")
+    if not isinstance(rows, list):
+        return None, "unexpected TheNewsAPI payload shape (missing data[])"
+
+    articles: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        article = _thenewsapi_row_to_article(row, enrich_images=enrich_images)
+        if article is not None:
+            articles.append(article)
+
+    return {
+        "provider": "thenewsapi",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "articles": articles,
     }, ""
@@ -450,7 +545,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--source",
-        choices=["actually_relevant", "newsdata"],
+        choices=["actually_relevant", "newsdata", "thenewsapi"],
         default=os.environ.get("NEWS_SOURCE", "actually_relevant"),
         help="Source provider to fetch from (default: env NEWS_SOURCE or actually_relevant)",
     )
@@ -468,6 +563,21 @@ def main() -> int:
         "--newsdata-language",
         default=os.environ.get("NEWSDATA_LANGUAGE", "en"),
         help="NewsData language filter (default: env NEWSDATA_LANGUAGE or en)",
+    )
+    parser.add_argument(
+        "--thenewsapi-base",
+        default=os.environ.get("THENEWSAPI_BASE", THENEWSAPI_BASE),
+        help="TheNewsAPI endpoint (default: env THENEWSAPI_BASE or https://api.thenewsapi.com/v1/news/top)",
+    )
+    parser.add_argument(
+        "--thenewsapi-token",
+        default=os.environ.get("THENEWSAPI_TOKEN", ""),
+        help="TheNewsAPI token (default: env THENEWSAPI_TOKEN)",
+    )
+    parser.add_argument(
+        "--thenewsapi-language",
+        default=os.environ.get("THENEWSAPI_LANGUAGE", "en"),
+        help="TheNewsAPI language filter (default: env THENEWSAPI_LANGUAGE or en)",
     )
     parser.add_argument(
         "--dry-run",
@@ -516,6 +626,18 @@ def main() -> int:
             api_key=api_key,
             language=args.newsdata_language,
         )
+    elif args.source == "thenewsapi":
+        token = (args.thenewsapi_token or "").strip()
+        if not token:
+            print("Missing TheNewsAPI token: set THENEWSAPI_TOKEN or pass --thenewsapi-token", file=sys.stderr)
+            return 1
+        url = build_thenewsapi_url(
+            args.query,
+            args.maxrecords,
+            args.thenewsapi_base,
+            api_token=token,
+            language=args.thenewsapi_language,
+        )
     else:
         url = build_ar_url(args.query, args.maxrecords, args.api_base)
     print(f"Fetching: {url}")
@@ -537,6 +659,8 @@ def main() -> int:
     print(f"Downloaded {len(raw_body)} bytes")
     if args.source == "newsdata":
         converted, convert_err = transform_newsdata_payload(raw_body, enrich_images=args.enrich_images)
+    elif args.source == "thenewsapi":
+        converted, convert_err = transform_thenewsapi_payload(raw_body, enrich_images=args.enrich_images)
     else:
         converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
     if converted is None:
