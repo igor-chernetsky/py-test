@@ -35,6 +35,7 @@ import boto3
 AR_API_BASE = "https://actually-relevant-api.onrender.com/api"
 NEWSDATA_API_BASE = "https://newsdata.io/api/1"
 THENEWSAPI_BASE = "https://api.thenewsapi.com/v1/news/top"
+MEDIASTACK_BASE = "http://api.mediastack.com/v1/news"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 # NOTE: This is plain-text search for Actually Relevant, not GDELT boolean syntax.
@@ -89,6 +90,31 @@ def build_thenewsapi_url(
     q = (query or "").strip()
     if q:
         params["search"] = q
+    return f"{api_base.rstrip('/')}?{urllib.parse.urlencode(params)}"
+
+
+def build_mediastack_url(
+    query: str,
+    maxrecords: int,
+    api_base: str,
+    api_key: str,
+    languages: str,
+    categories: str,
+) -> str:
+    # Free plan is typically low throughput, keep moderate batch.
+    limit = max(1, min(maxrecords, 25))
+    params = {
+        "access_key": api_key,
+        "languages": languages,
+        "limit": str(limit),
+        "sort": "published_desc",
+    }
+    q = (query or "").strip()
+    if q:
+        params["keywords"] = q
+    c = (categories or "").strip()
+    if c:
+        params["categories"] = c
     return f"{api_base.rstrip('/')}?{urllib.parse.urlencode(params)}"
 
 
@@ -310,6 +336,43 @@ def _thenewsapi_row_to_article(row: dict[str, object], *, enrich_images: bool) -
     return out
 
 
+def _mediastack_row_to_article(row: dict[str, object], *, enrich_images: bool) -> dict[str, object] | None:
+    source_url = row.get("url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+    source_url = source_url.strip()
+    title = row.get("title")
+    pub_date = row.get("published_at")
+    description = row.get("description")
+    source_name = row.get("source")
+    category = row.get("category")
+    country = row.get("country")
+    language = row.get("language")
+
+    hostname = urllib.parse.urlparse(source_url).hostname
+    social_image = row.get("image")
+    if (not social_image or not str(social_image).strip()) and enrich_images:
+        social_image = _fetch_og_image(source_url)
+
+    out: dict[str, object] = {
+        "url": source_url,
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "seendate": _iso_to_seendate(pub_date),
+        "domain": hostname,
+        "language": str(language).strip().capitalize() if isinstance(language, str) and language.strip() else "English",
+        "sourcecountry": str(country).strip().upper() if isinstance(country, str) and country.strip() else None,
+        "socialimage": social_image,
+        "summary": description if isinstance(description, str) else None,
+        "quote": None,
+        "emotionTag": None,
+        "relevance": None,
+        "sourceTitle": source_name if isinstance(source_name, str) else None,
+        "issue": category if isinstance(category, str) else None,
+        "feedTitle": "Mediastack",
+    }
+    return out
+
+
 def transform_source_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
     """
     Convert Actually Relevant `/api/stories` response into expected `{\"articles\": [...]}`.
@@ -412,6 +475,42 @@ def transform_thenewsapi_payload(raw_body: bytes, *, enrich_images: bool) -> tup
 
     return {
         "provider": "thenewsapi",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "articles": articles,
+    }, ""
+
+
+def transform_mediastack_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
+    text = raw_body.decode("utf-8", errors="replace")
+    if "<!doctype html" in text.lower() or "<html" in text.lower():
+        return None, "received HTML instead of JSON from Mediastack API"
+    try:
+        src = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"invalid json: {e}"
+
+    if not isinstance(src, dict):
+        return None, "unexpected Mediastack payload shape (top-level is not an object)"
+
+    if isinstance(src.get("error"), dict):
+        err = src["error"]
+        msg = err.get("message") if isinstance(err.get("message"), str) else str(err)
+        return None, f"Mediastack API error: {msg}"
+
+    rows = src.get("data")
+    if not isinstance(rows, list):
+        return None, "unexpected Mediastack payload shape (missing data[])"
+
+    articles: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        article = _mediastack_row_to_article(row, enrich_images=enrich_images)
+        if article is not None:
+            articles.append(article)
+
+    return {
+        "provider": "mediastack",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "articles": articles,
     }, ""
@@ -545,7 +644,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--source",
-        choices=["actually_relevant", "newsdata", "thenewsapi"],
+        choices=["actually_relevant", "newsdata", "thenewsapi", "mediastack"],
         default=os.environ.get("NEWS_SOURCE", "actually_relevant"),
         help="Source provider to fetch from (default: env NEWS_SOURCE or actually_relevant)",
     )
@@ -578,6 +677,26 @@ def main() -> int:
         "--thenewsapi-language",
         default=os.environ.get("THENEWSAPI_LANGUAGE", "en"),
         help="TheNewsAPI language filter (default: env THENEWSAPI_LANGUAGE or en)",
+    )
+    parser.add_argument(
+        "--mediastack-base",
+        default=os.environ.get("MEDIASTACK_BASE", MEDIASTACK_BASE),
+        help="Mediastack endpoint (default: env MEDIASTACK_BASE or http://api.mediastack.com/v1/news)",
+    )
+    parser.add_argument(
+        "--mediastack-api-key",
+        default=os.environ.get("MEDIASTACK_API_KEY", ""),
+        help="Mediastack API key (default: env MEDIASTACK_API_KEY)",
+    )
+    parser.add_argument(
+        "--mediastack-languages",
+        default=os.environ.get("MEDIASTACK_LANGUAGES", "en"),
+        help="Mediastack languages filter (comma-separated, default: en)",
+    )
+    parser.add_argument(
+        "--mediastack-categories",
+        default=os.environ.get("MEDIASTACK_CATEGORIES", "general,science,technology,health"),
+        help="Mediastack categories filter (comma-separated)",
     )
     parser.add_argument(
         "--dry-run",
@@ -638,6 +757,19 @@ def main() -> int:
             api_token=token,
             language=args.thenewsapi_language,
         )
+    elif args.source == "mediastack":
+        api_key = (args.mediastack_api_key or "").strip()
+        if not api_key:
+            print("Missing Mediastack API key: set MEDIASTACK_API_KEY or pass --mediastack-api-key", file=sys.stderr)
+            return 1
+        url = build_mediastack_url(
+            args.query,
+            args.maxrecords,
+            args.mediastack_base,
+            api_key=api_key,
+            languages=args.mediastack_languages,
+            categories=args.mediastack_categories,
+        )
     else:
         url = build_ar_url(args.query, args.maxrecords, args.api_base)
     print(f"Fetching: {url}")
@@ -661,6 +793,8 @@ def main() -> int:
         converted, convert_err = transform_newsdata_payload(raw_body, enrich_images=args.enrich_images)
     elif args.source == "thenewsapi":
         converted, convert_err = transform_thenewsapi_payload(raw_body, enrich_images=args.enrich_images)
+    elif args.source == "mediastack":
+        converted, convert_err = transform_mediastack_payload(raw_body, enrich_images=args.enrich_images)
     else:
         converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
     if converted is None:
