@@ -100,6 +100,7 @@ def build_mediastack_url(
     api_key: str,
     languages: str,
     categories: str,
+    use_keywords: bool,
 ) -> str:
     # Free plan is typically low throughput, keep moderate batch.
     limit = max(1, min(maxrecords, 25))
@@ -110,7 +111,7 @@ def build_mediastack_url(
         "sort": "published_desc",
     }
     q = (query or "").strip()
-    if q:
+    if use_keywords and q:
         params["keywords"] = q
     c = (categories or "").strip()
     if c:
@@ -699,6 +700,12 @@ def main() -> int:
         help="Mediastack categories filter (comma-separated)",
     )
     parser.add_argument(
+        "--mediastack-use-keywords",
+        action="store_true",
+        default=os.environ.get("MEDIASTACK_USE_KEYWORDS", "").strip().lower() in ("1", "true", "yes", "on"),
+        help="Also pass --query as Mediastack keywords (default: off)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch only, print size and URL; do not upload to S3",
@@ -769,6 +776,7 @@ def main() -> int:
             api_key=api_key,
             languages=args.mediastack_languages,
             categories=args.mediastack_categories,
+            use_keywords=args.mediastack_use_keywords,
         )
     else:
         url = build_ar_url(args.query, args.maxrecords, args.api_base)
