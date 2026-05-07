@@ -77,16 +77,14 @@ DDL_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS news_articles_title_lower_btrim_idx
         ON news_articles (lower(btrim(COALESCE(title, ''))));
     """,
-    # Remove duplicate rows (same normalized title + language + domain) before unique index can apply.
+    # Remove duplicate rows (same normalized title) before unique index can apply.
     """
     DELETE FROM news_articles
     WHERE id IN (
         SELECT id FROM (
             SELECT id,
                    ROW_NUMBER() OVER (
-                       PARTITION BY lower(btrim(COALESCE(title, ''))),
-                                    COALESCE(language, ''),
-                                    COALESCE(domain, '')
+                       PARTITION BY lower(btrim(COALESCE(title, '')))
                        ORDER BY created_at DESC NULLS LAST, id DESC
                    ) AS rn
             FROM news_articles
@@ -96,11 +94,12 @@ DDL_STATEMENTS = [
     );
     """,
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS news_articles_title_lang_domain_uidx
+    DROP INDEX IF EXISTS news_articles_title_lang_domain_uidx;
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS news_articles_title_uidx
         ON news_articles (
-            lower(btrim(COALESCE(title, ''))),
-            COALESCE(language, ''),
-            COALESCE(domain, '')
+            lower(btrim(COALESCE(title, '')))
         )
         WHERE length(btrim(COALESCE(title, ''))) > 0;
     """,

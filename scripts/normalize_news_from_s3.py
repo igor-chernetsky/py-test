@@ -19,7 +19,7 @@ Run after create_news_tables.py:
   python scripts/normalize_news_from_s3.py --no-embed   # skip sentence-transformers (no vector fill)
   python scripts/normalize_news_from_s3.py --no-dedupe # skip DB dedupe step at startup
 
-create_news_tables adds a partial unique index on (normalized title, language, domain) and deletes
+create_news_tables adds a partial unique index on normalized title and deletes
 existing duplicates (newest row kept). normalize repeats dedupe by default before ingesting S3.
 
 To fill embedding for rows already in DB (e.g. after ingesting with --no-embed), run:
@@ -192,44 +192,32 @@ def vector_literal_from_text(text: str, no_embed: bool) -> str | None:
     return "[" + ",".join(str(float(x)) for x in vec) + "]"
 
 
-def article_key_taken_by_other_url(
-    cur,
-    title: str | None,
-    domain: str | None,
-    language: str | None,
-    url: str,
-) -> bool:
-    """True if another row already has the same (title, language, domain) key (matches DB unique index)."""
+def article_key_taken_by_other_url(cur, title: str | None, url: str) -> bool:
+    """True if another row already has the same normalized title but a different URL."""
     t = (title or "").strip()
     if not t:
         return False
     u = url.strip()
-    d = (domain or "").strip() or None
-    lang = (language or "").strip() or None
     cur.execute(
         """
         SELECT 1 FROM news_articles
         WHERE lower(btrim(COALESCE(title, ''))) = lower(btrim(COALESCE(%s, '')))
           AND length(btrim(COALESCE(%s, ''))) > 0
-          AND COALESCE(language, '') = COALESCE(%s::text, '')
-          AND COALESCE(domain, '') = COALESCE(%s::text, '')
           AND url <> %s
         LIMIT 1
         """,
-        (t, t, lang, d, u),
+        (t, t, u),
     )
     return cur.fetchone() is not None
 
 
-DEDUPE_BY_TITLE_LANG_DOMAIN = """
+DEDUPE_BY_TITLE = """
 DELETE FROM news_articles
 WHERE id IN (
     SELECT id FROM (
         SELECT id,
                ROW_NUMBER() OVER (
-                   PARTITION BY lower(btrim(COALESCE(title, ''))),
-                                COALESCE(language, ''),
-                                COALESCE(domain, '')
+                   PARTITION BY lower(btrim(COALESCE(title, '')))
                    ORDER BY created_at DESC NULLS LAST, id DESC
                ) AS rn
         FROM news_articles
@@ -240,10 +228,10 @@ WHERE id IN (
 """
 
 
-def dedupe_news_articles_by_title_lang_domain(conn) -> int:
-    """Drop duplicate rows; keep the newest (created_at, id) per (title, language, domain)."""
+def dedupe_news_articles_by_title(conn) -> int:
+    """Drop duplicate rows; keep the newest (created_at, id) per normalized title."""
     with conn.cursor() as cur:
-        cur.execute(DEDUPE_BY_TITLE_LANG_DOMAIN)
+        cur.execute(DEDUPE_BY_TITLE)
         return cur.rowcount
 
 
@@ -415,9 +403,7 @@ def process_object(
             if positive_only and not is_positive_candidate(title, snippet_dict):
                 continue
 
-            domain = tup[3]
-            language = tup[4]
-            if article_key_taken_by_other_url(cur, title, domain, language, url):
+            if article_key_taken_by_other_url(cur, title, url):
                 continue
 
             try:
@@ -463,7 +449,7 @@ def main() -> int:
     parser.add_argument(
         "--no-dedupe",
         action="store_true",
-        help="Skip DELETE of duplicate rows (same title+language+domain) before processing S3",
+        help="Skip DELETE of duplicate rows (same normalized title) before processing S3",
     )
     positive_filter_default = _truthy_env("POSITIVE_ONLY", True)
     parser.add_argument(
@@ -505,11 +491,11 @@ def main() -> int:
     conn.commit()
 
     if not args.no_dedupe:
-        removed = dedupe_news_articles_by_title_lang_domain(conn)
+        removed = dedupe_news_articles_by_title(conn)
         conn.commit()
         if removed:
             print(
-                f"Deduped DB: removed {removed} row(s) with duplicate title+language+domain (kept newest)."
+                f"Deduped DB: removed {removed} row(s) with duplicate normalized title (kept newest)."
             )
 
     pending = [item for item in keys if item["Key"] not in completed]
