@@ -467,7 +467,11 @@ def list_digest_dates() -> dict[str, object]:
 
 @api_router.get("/digests/by-date")
 def get_digest_by_date(
-    digest_date: str = Query(..., description="UTC calendar date YYYY-MM-DD"),
+    digest_date: str = Query(
+        ...,
+        alias="date",
+        description="UTC calendar date YYYY-MM-DD (query name: date)",
+    ),
 ) -> dict[str, object]:
     """One daily digest (markdown body + meta including image slot mapping)."""
     try:
