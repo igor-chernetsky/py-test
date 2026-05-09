@@ -16,6 +16,7 @@ from typing import Literal
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 
 app = FastAPI(
     title="Learning API",
@@ -27,6 +28,12 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 api_router = APIRouter(prefix="/api")
+
+
+@app.get("/docs", include_in_schema=False)
+def redirect_legacy_swagger() -> RedirectResponse:
+    """Default FastAPI path /docs → /api/docs (matches public nginx /api prefix)."""
+    return RedirectResponse(url="/api/docs")
 
 logger = logging.getLogger("healthcheck.db")
 
