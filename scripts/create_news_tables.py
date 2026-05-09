@@ -103,6 +103,21 @@ DDL_STATEMENTS = [
         )
         WHERE length(btrim(COALESCE(title, ''))) > 0;
     """,
+    """
+    CREATE TABLE IF NOT EXISTS daily_digests (
+        id BIGSERIAL PRIMARY KEY,
+        digest_date DATE NOT NULL,
+        title TEXT,
+        body_markdown TEXT NOT NULL,
+        meta JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (digest_date)
+    );
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS daily_digests_created_at_idx
+        ON daily_digests (created_at DESC);
+    """,
 ]
 
 
@@ -128,7 +143,7 @@ def main() -> int:
         with conn.cursor() as cur:
             for stmt in DDL_STATEMENTS:
                 cur.execute(stmt)
-        print("Tables created or already exist (news_s3_ingest, news_articles).")
+        print("Tables created or already exist (news_s3_ingest, news_articles, daily_digests).")
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

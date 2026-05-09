@@ -36,6 +36,7 @@ AR_API_BASE = "https://actually-relevant-api.onrender.com/api"
 NEWSDATA_API_BASE = "https://newsdata.io/api/1"
 THENEWSAPI_BASE = "https://api.thenewsapi.com/v1/news/top"
 MEDIASTACK_BASE = "http://api.mediastack.com/v1/news"
+NEWSAPI_BASE = "https://newsapi.org/v2"
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 # NOTE: This is plain-text search for Actually Relevant, not GDELT boolean syntax.
@@ -117,6 +118,57 @@ def build_mediastack_url(
     if c:
         params["categories"] = c
     return f"{api_base.rstrip('/')}?{urllib.parse.urlencode(params)}"
+
+
+def build_newsapi_url(
+    maxrecords: int,
+    api_base: str,
+    api_key: str,
+    mode: str,
+    query: str,
+    country: str,
+    category: str,
+    language: str,
+) -> str:
+    """NewsAPI.org v2 (top-headlines or everything). Max pageSize is 100."""
+    page_size = max(1, min(maxrecords, 100))
+    base = api_base.rstrip("/")
+    mode_norm = (mode or "top_headlines").strip().lower().replace("-", "_")
+    if mode_norm == "everything":
+        params: dict[str, str] = {
+            "apiKey": api_key,
+            "pageSize": str(page_size),
+            "sortBy": "publishedAt",
+        }
+        if language:
+            params["language"] = language
+        q = (query or "").strip()
+        if q:
+            params["q"] = q
+        path = f"{base}/everything"
+    else:
+        params = {"apiKey": api_key, "pageSize": str(page_size)}
+        if country:
+            params["country"] = country
+        if category:
+            params["category"] = category
+        path = f"{base}/top-headlines"
+    return f"{path}?{urllib.parse.urlencode(params)}"
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Hide common API key query params in logged URLs."""
+    parts = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    sensitive_keys = {"apikey", "access_key", "api_token", "key"}
+    redacted: list[tuple[str, str]] = []
+    for k, v in q:
+        if k.lower() in sensitive_keys:
+            redacted.append((k, "***"))
+        else:
+            redacted.append((k, v))
+    new_query = urllib.parse.urlencode(redacted)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
 RETRYABLE_HTTP = {429, 502, 503}
@@ -517,6 +569,76 @@ def transform_mediastack_payload(raw_body: bytes, *, enrich_images: bool) -> tup
     }, ""
 
 
+def _newsapi_row_to_article(row: dict[str, object], *, enrich_images: bool) -> dict[str, object] | None:
+    source_url = row.get("url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return None
+    source_url = source_url.strip()
+    title = row.get("title")
+    pub_date = row.get("publishedAt") or row.get("published_at")
+    description = row.get("description")
+    content = row.get("content")
+    src = row.get("source")
+    source_name = src.get("name") if isinstance(src, dict) else None
+
+    hostname = urllib.parse.urlparse(source_url).hostname
+    social_image = row.get("urlToImage")
+    if (not social_image or not str(social_image).strip()) and enrich_images:
+        social_image = _fetch_og_image(source_url)
+
+    out: dict[str, object] = {
+        "url": source_url,
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "seendate": _iso_to_seendate(pub_date) if pub_date is not None else None,
+        "domain": hostname,
+        "language": "English",
+        "sourcecountry": None,
+        "socialimage": social_image if isinstance(social_image, str) else None,
+        "summary": description if isinstance(description, str) else None,
+        "quote": content if isinstance(content, str) else None,
+        "emotionTag": None,
+        "relevance": None,
+        "sourceTitle": source_name if isinstance(source_name, str) else None,
+        "issue": None,
+        "feedTitle": "NewsAPI.org",
+    }
+    return out
+
+
+def transform_newsapi_payload(raw_body: bytes, *, enrich_images: bool) -> tuple[dict[str, object] | None, str]:
+    text = raw_body.decode("utf-8", errors="replace")
+    if "<!doctype html" in text.lower() or "<html" in text.lower():
+        return None, "received HTML instead of JSON from NewsAPI.org"
+    try:
+        src = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return None, f"invalid json: {e}"
+
+    if not isinstance(src, dict):
+        return None, "unexpected NewsAPI.org payload shape (top-level is not an object)"
+    status = src.get("status")
+    if status != "ok":
+        return None, f"NewsAPI.org error: {src.get('message') or src.get('code') or status}"
+
+    rows = src.get("articles")
+    if not isinstance(rows, list):
+        return None, "unexpected NewsAPI.org payload shape (missing articles[])"
+
+    articles: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        article = _newsapi_row_to_article(row, enrich_images=enrich_images)
+        if article is not None:
+            articles.append(article)
+
+    return {
+        "provider": "newsapi_org",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "articles": articles,
+    }, ""
+
+
 def fetch_gdelt(
     url: str,
     *,
@@ -645,7 +767,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--source",
-        choices=["actually_relevant", "newsdata", "thenewsapi", "mediastack"],
+        choices=["actually_relevant", "newsdata", "thenewsapi", "mediastack", "newsapi"],
         default=os.environ.get("NEWS_SOURCE", "actually_relevant"),
         help="Source provider to fetch from (default: env NEWS_SOURCE or actually_relevant)",
     )
@@ -704,6 +826,37 @@ def main() -> int:
         action="store_true",
         default=os.environ.get("MEDIASTACK_USE_KEYWORDS", "").strip().lower() in ("1", "true", "yes", "on"),
         help="Also pass --query as Mediastack keywords (default: off)",
+    )
+    parser.add_argument(
+        "--newsapi-base",
+        default=os.environ.get("NEWSAPI_BASE", NEWSAPI_BASE),
+        help="NewsAPI.org v2 base (default: env NEWSAPI_BASE or https://newsapi.org/v2)",
+    )
+    parser.add_argument(
+        "--newsapi-key",
+        default=os.environ.get("NEWSAPI_KEY", os.environ.get("NEWSAPI_API_KEY", "")),
+        help="NewsAPI.org API key (default: env NEWSAPI_KEY or NEWSAPI_API_KEY)",
+    )
+    parser.add_argument(
+        "--newsapi-mode",
+        choices=["top_headlines", "everything"],
+        default=os.environ.get("NEWSAPI_MODE", "top_headlines"),
+        help="NewsAPI.org endpoint (default: env NEWSAPI_MODE or top_headlines)",
+    )
+    parser.add_argument(
+        "--newsapi-country",
+        default=os.environ.get("NEWSAPI_COUNTRY", "us"),
+        help="top-headlines: country code (default: env NEWSAPI_COUNTRY or us)",
+    )
+    parser.add_argument(
+        "--newsapi-category",
+        default=os.environ.get("NEWSAPI_CATEGORY", ""),
+        help="top-headlines: optional category (business, entertainment, general, health, science, sports, technology)",
+    )
+    parser.add_argument(
+        "--newsapi-language",
+        default=os.environ.get("NEWSAPI_LANGUAGE", "en"),
+        help="everything: language (default: env NEWSAPI_LANGUAGE or en)",
     )
     parser.add_argument(
         "--dry-run",
@@ -778,9 +931,27 @@ def main() -> int:
             categories=args.mediastack_categories,
             use_keywords=args.mediastack_use_keywords,
         )
+    elif args.source == "newsapi":
+        nkey = (args.newsapi_key or "").strip()
+        if not nkey:
+            print(
+                "Missing NewsAPI.org key: set NEWSAPI_KEY (or NEWSAPI_API_KEY) or pass --newsapi-key",
+                file=sys.stderr,
+            )
+            return 1
+        url = build_newsapi_url(
+            args.maxrecords,
+            args.newsapi_base,
+            api_key=nkey,
+            mode=args.newsapi_mode,
+            query=args.query,
+            country=(args.newsapi_country or "").strip(),
+            category=(args.newsapi_category or "").strip(),
+            language=(args.newsapi_language or "").strip(),
+        )
     else:
         url = build_ar_url(args.query, args.maxrecords, args.api_base)
-    print(f"Fetching: {url}")
+    print(f"Fetching: {_redact_url_for_log(url)}")
 
     try:
         raw_body = fetch_gdelt(
@@ -803,6 +974,8 @@ def main() -> int:
         converted, convert_err = transform_thenewsapi_payload(raw_body, enrich_images=args.enrich_images)
     elif args.source == "mediastack":
         converted, convert_err = transform_mediastack_payload(raw_body, enrich_images=args.enrich_images)
+    elif args.source == "newsapi":
+        converted, convert_err = transform_newsapi_payload(raw_body, enrich_images=args.enrich_images)
     else:
         converted, convert_err = transform_source_payload(raw_body, enrich_images=args.enrich_images)
     if converted is None:
