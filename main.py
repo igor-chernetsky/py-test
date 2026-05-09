@@ -10,6 +10,7 @@ Routes are under /api (e.g. /api/health, /api/news).
 import json
 import logging
 import os
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -440,6 +441,61 @@ def get_news_detail(url: str = Query(..., min_length=1)) -> dict[str, object]:
     if not row:
         raise HTTPException(status_code=404, detail="Article not found")
     return dict(row)
+
+
+@api_router.get("/digests")
+def list_digest_dates() -> dict[str, object]:
+    """ISO dates (YYYY-MM-DD) that have a saved digest, newest first."""
+    sql = """
+        SELECT digest_date
+        FROM daily_digests
+        ORDER BY digest_date DESC
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    dates: list[str] = []
+    for row in rows:
+        d = row.get("digest_date")
+        if hasattr(d, "isoformat"):
+            dates.append(d.isoformat())
+        else:
+            dates.append(str(d))
+    return {"dates": dates}
+
+
+@api_router.get("/digests/by-date")
+def get_digest_by_date(
+    digest_date: str = Query(..., description="UTC calendar date YYYY-MM-DD"),
+) -> dict[str, object]:
+    """One daily digest (markdown body + meta including image slot mapping)."""
+    try:
+        d = date.fromisoformat(digest_date.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid digest_date; use YYYY-MM-DD") from None
+
+    sql = """
+        SELECT digest_date, title, body_markdown, meta, created_at
+        FROM daily_digests
+        WHERE digest_date = %s
+        LIMIT 1
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (d,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Digest not found for that date")
+
+    out = dict(row)
+    dd = out.get("digest_date")
+    if hasattr(dd, "isoformat"):
+        out["digest_date"] = dd.isoformat()
+    ca = out.get("created_at")
+    if ca is not None and hasattr(ca, "isoformat"):
+        out["created_at"] = ca.isoformat()
+    return out
 
 
 app.include_router(api_router)
