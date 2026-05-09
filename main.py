@@ -3,8 +3,7 @@ FastAPI application: HTTP routes and in-memory "database" for learning.
 
 Run locally:
     uvicorn main:app --reload
-Then open http://127.0.0.1:8000/docs for interactive API docs.
-Routes are under /api (e.g. /api/health, /api/news).
+Interactive docs: /api/docs (and /api/redoc). Example routes: /api/health, /api/news.
 """
 
 import json
@@ -22,6 +21,10 @@ app = FastAPI(
     title="Learning API",
     description="Simple API with health check and news list from PostgreSQL.",
     version="0.2.0",
+    # Same prefix as APIRouter — works when nginx only proxies /api/* to this app.
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
 )
 api_router = APIRouter(prefix="/api")
 
