@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Emit topic_embeddings.json for main.py (same model/dim as normalize_news_from_s3.py).
+Emit topic_embeddings.json for offline experiments (same model/dim as normalize_news_from_s3.py).
+The FastAPI app no longer reads this file for /api/news — topic filters were removed.
 
 Each topic is represented by several short phrases; we L2-normalize per phrase,
 average the vectors, then L2-normalize the mean. One long keyword blob tends to
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Slugs must match visor TOPIC_FILTERS; values are the `topic=` API values.
+# Topic slugs (legacy / experiments only).
 # Several focused sentences per topic work better than one huge bag of words.
 TOPICS: dict[str, list[str]] = {
     "nature": [

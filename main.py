@@ -6,11 +6,9 @@ Run locally:
 Interactive docs: /api/docs (and /api/redoc). Example routes: /api/health, /api/news.
 """
 
-import json
 import logging
 import os
 from datetime import date
-from pathlib import Path
 from typing import Literal
 
 import psycopg2
@@ -36,112 +34,6 @@ def redirect_legacy_swagger() -> RedirectResponse:
     return RedirectResponse(url="/api/docs")
 
 logger = logging.getLogger("healthcheck.db")
-
-
-def _topic_embeddings_path() -> Path:
-    """
-    JSON path: TOPIC_EMBEDDINGS_PATH env (absolute or relative to cwd), else next to this file.
-    """
-    override = os.getenv("TOPIC_EMBEDDINGS_PATH", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    return (Path(__file__).resolve().parent / "topic_embeddings.json").resolve()
-
-
-def _read_topic_vector_literals(path: Path) -> dict[str, str]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    out: dict[str, str] = {}
-    for slug, arr in raw.items():
-        if not isinstance(arr, list):
-            continue
-        out[str(slug)] = "[" + ",".join(str(float(x)) for x in arr) + "]"
-    return out
-
-
-_topic_file_mtime: float | None = None
-_topic_vector_literals_cache: dict[str, str] = {}
-
-
-def get_topic_vector_literals() -> dict[str, str]:
-    """
-    Cached read of topic_embeddings.json; reloads when the file's mtime changes.
-    Avoids empty topic maps when the file is added after the process starts or the service cwd differs.
-    """
-    global _topic_file_mtime, _topic_vector_literals_cache
-    path = _topic_embeddings_path()
-    if not path.is_file():
-        if _topic_vector_literals_cache:
-            logger.warning("topic embeddings file disappeared, clearing cache: %s", path)
-            _topic_vector_literals_cache = {}
-        elif _topic_file_mtime is None:
-            logger.warning(
-                "topic_embeddings.json not found at %s (set TOPIC_EMBEDDINGS_PATH if it lives elsewhere)",
-                path,
-            )
-        _topic_file_mtime = -1.0
-        return {}
-    mtime = path.stat().st_mtime
-    if _topic_vector_literals_cache and mtime == _topic_file_mtime:
-        return _topic_vector_literals_cache
-    try:
-        _topic_vector_literals_cache = _read_topic_vector_literals(path)
-        _topic_file_mtime = mtime
-        logger.info(
-            "Loaded topic embeddings: %s (%d topic(s))",
-            path,
-            len(_topic_vector_literals_cache),
-        )
-    except Exception:
-        logger.exception("Failed to parse topic embeddings: %s", path)
-        _topic_vector_literals_cache = {}
-    return _topic_vector_literals_cache
-
-
-# Phrases the older visor sent as `topic=` before switching to slugs.
-_LEGACY_TOPIC_PHRASE_TO_SLUG: dict[str, str] = {
-    "nature environment wildlife biodiversity climate earth": "nature",
-    "world international global countries diplomacy events": "world",
-    "science research discovery innovation technology space": "science",
-    "family parenting relationships children home wellbeing": "family",
-    # backward compatibility with older topic values
-    "climate change environment energy sustainability": "nature",
-    "technology software artificial intelligence computing": "science",
-    "health medicine public health disease healthcare": "family",
-}
-
-
-def _resolve_topic_vector_literal(topic_param: str) -> str | None:
-    literals = get_topic_vector_literals()
-    if not literals:
-        return None
-    key = " ".join(topic_param.strip().lower().replace("+", " ").split())
-    if not key:
-        return None
-    if key in literals:
-        return literals[key]
-    slug = _LEGACY_TOPIC_PHRASE_TO_SLUG.get(key)
-    if slug and slug in literals:
-        return literals[slug]
-    return None
-
-
-def topic_max_distance() -> float:
-    """
-    Cosine distance cutoff for topic-filtered search (lower = stricter).
-    With normalized vectors, good matches are typically closer to 0.
-    """
-    # Slightly looser default: topic centroids are multi-phrase means; strict 0.72
-    # often hid too many relevant rows after phrase updates.
-    raw = os.getenv("TOPIC_MAX_DISTANCE", "0.82").strip()
-    try:
-        val = float(raw)
-    except ValueError:
-        return 0.82
-    if val < 0:
-        return 0.0
-    if val > 2:
-        return 2.0
-    return val
 
 
 def get_db_status() -> str:
@@ -259,53 +151,19 @@ def list_news(
     domain: str | None = None,
     language: str | None = None,
     source_country: str | None = None,
-    topic: str | None = Query(
-        default=None,
-        description=(
-            "Topic slug (nature, world, science): rank by pgvector similarity using "
-            "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding. "
-            "Also applies a similarity cutoff so non-relevant rows are excluded."
-        ),
-    ),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order_by: Literal["created_at", "seen_at"] = Query(
         default="created_at",
         description=(
-            "created_at: newest ingested rows first (matches typical SQL ORDER BY created_at). "
-            "seen_at: GDELT 'seen' time first. "
-            "Ignored for final ordering when `topic` is set (results ordered by vector similarity)."
+            "created_at: newest ingested rows first. "
+            "seen_at: source 'seen' time first (when present)."
         ),
     ),
 ) -> dict[str, object]:
     """
     List normalized news from PostgreSQL with optional filters.
     """
-    topic_clean = (topic or "").strip()
-    use_vector = bool(topic_clean)
-    vec_lit: str | None = None
-    max_distance = topic_max_distance()
-    if use_vector:
-        vec_lit = _resolve_topic_vector_literal(topic_clean)
-        if vec_lit is None:
-            if not get_topic_vector_literals():
-                p = _topic_embeddings_path()
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Topic search is not configured: no topic embeddings loaded. "
-                        f"Expected file at {p} (override with TOPIC_EMBEDDINGS_PATH). "
-                        "Restart the API after adding the file."
-                    ),
-                )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unknown topic. Use one of: nature, world, science "
-                    "(or redeploy with matching topic_embeddings.json)."
-                ),
-            )
-
     where_parts: list[str] = []
     values: list[object] = []
 
@@ -322,8 +180,6 @@ def list_news(
     if source_country:
         where_parts.append("source_country = %s")
         values.append(source_country)
-    if use_vector:
-        where_parts.append("embedding IS NOT NULL")
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
@@ -339,50 +195,22 @@ def list_news(
         else "seen_at DESC NULLS LAST, id DESC"
     )
 
-    if use_vector and vec_lit is not None:
-        sql = f"""
-            SELECT
-                d.id,
-                d.url,
-                d.title,
-                d.seen_at,
-                d.created_at,
-                d.domain,
-                d.language,
-                d.source_country,
-                d.social_image_url,
-                d.s3_bucket,
-                d.s3_object_key,
-                d.gdelt_snippet
-            FROM (
-                SELECT DISTINCT ON (url)
-                    id,
-                    url,
-                    title,
-                    seen_at,
-                    created_at,
-                    domain,
-                    language,
-                    source_country,
-                    social_image_url,
-                    s3_bucket,
-                    s3_object_key,
-                    gdelt_snippet,
-                    embedding
-                FROM news_articles
-                {where_sql}
-                ORDER BY url ASC, {inner_order_tail}
-            ) AS d
-            CROSS JOIN (SELECT %s::vector AS qv) AS qvec
-            WHERE d.embedding IS NOT NULL
-              AND (d.embedding <=> qvec.qv) <= %s
-            ORDER BY d.embedding <=> qvec.qv ASC NULLS LAST
-            LIMIT %s OFFSET %s
-        """
-        values.extend([vec_lit, max_distance, limit, offset])
-    else:
-        sql = f"""
-            SELECT
+    sql = f"""
+        SELECT
+            id,
+            url,
+            title,
+            seen_at,
+            created_at,
+            domain,
+            language,
+            source_country,
+            social_image_url,
+            s3_bucket,
+            s3_object_key,
+            gdelt_snippet
+        FROM (
+            SELECT DISTINCT ON (url)
                 id,
                 url,
                 title,
@@ -395,28 +223,14 @@ def list_news(
                 s3_bucket,
                 s3_object_key,
                 gdelt_snippet
-            FROM (
-                SELECT DISTINCT ON (url)
-                    id,
-                    url,
-                    title,
-                    seen_at,
-                    created_at,
-                    domain,
-                    language,
-                    source_country,
-                    social_image_url,
-                    s3_bucket,
-                    s3_object_key,
-                    gdelt_snippet
-                FROM news_articles
-                {where_sql}
-                ORDER BY url ASC, {inner_order_tail}
-            ) AS deduped
-            ORDER BY {order_sql}
-            LIMIT %s OFFSET %s
-        """
-        values.extend([limit, offset])
+            FROM news_articles
+            {where_sql}
+            ORDER BY url ASC, {inner_order_tail}
+        ) AS deduped
+        ORDER BY {order_sql}
+        LIMIT %s OFFSET %s
+    """
+    values.extend([limit, offset])
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:

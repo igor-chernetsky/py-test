@@ -26,9 +26,13 @@ DEFAULT_FEEDS = [
     # Science-heavy feeds
     "https://www.sciencedaily.com/rss/all.xml",
     "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-    # Family/health-adjacent feeds
+    # Public health
     "https://www.cdc.gov/media/rss/rss.xml",
     "https://www.who.int/rss-feeds/news-english.xml",
+    # Culture & film
+    "https://www.theguardian.com/culture/rss",
+    "https://www.theguardian.com/film/rss",
+    "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
 ]
 
 
@@ -264,7 +268,7 @@ def main() -> int:
         return 0
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    key = f"{args.prefix}{ts}_rss_science_family.json"
+    key = f"{args.prefix}{ts}_rss_feeds.json"
     print(f"Uploading s3://{args.bucket}/{key}")
     try:
         upload_to_s3(args.bucket, key, out)
