@@ -33,11 +33,16 @@ TOPICS: dict[str, str] = {
         "culture religion sports Olympics refugees borders United Nations summits"
     ),
     "science": (
-        "science research discovery scientific study experiment peer reviewed journal "
-        "laboratory medicine biology physics chemistry astronomy space oceanography "
-        "geophysics climate science earth system atmospheric science innovation "
-        "genetics neuroscience immunology epidemiology statistics data modeling hypothesis "
-        "engineering materials nanotechnology robotics AI machine learning publication"
+        "science research discovery breakthrough scientists discover findings evidence "
+        "hypothesis experiment laboratory peer reviewed journal publication preprint "
+        "biology biochemistry molecular biology cell genetics genomics proteomics "
+        "neuroscience brain nervous system neurons circuits synapses spinal cord "
+        "sensory perception pain itch scratching dermatology skin immunology "
+        "physiology pharmacology drug discovery clinical trials biomedicine medicine "
+        "physics chemistry astronomy astrophysics cosmology space oceanography "
+        "geophysics earth system atmospheric climate modeling statistics data science "
+        "engineering materials nanotechnology robotics artificial intelligence machine learning "
+        "microscopy imaging CRISPR biotechnology innovation STEM"
     ),
 }
 
