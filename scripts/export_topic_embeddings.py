@@ -2,6 +2,10 @@
 """
 Emit topic_embeddings.json for main.py (same model/dim as normalize_news_from_s3.py).
 
+Each topic is represented by several short phrases; we L2-normalize per phrase,
+average the vectors, then L2-normalize the mean. One long keyword blob tends to
+dilute the embedding and *reduces* recall in topic-filtered search.
+
 Run locally after pip install -r requirements.txt (needs sentence-transformers once).
 Writes JSON next to main.py by default. The API only reads that JSON — you do not need
 this script on the server if topic_embeddings.json is already deployed.
@@ -14,66 +18,42 @@ import math
 import os
 from pathlib import Path
 
-# Phrases must match visor TOPIC_FILTERS; slugs are the `topic=` API values.
-TOPICS: dict[str, str] = {
-    "nature": (
-        "nature wildlife wild animals biodiversity conservation ecology ecosystems habitats "
-        "forests woodlands grasslands wetlands rivers lakes oceans coasts marine shoreline "
-        "marine biology ocean life seals sea lions walruses whales dolphins porpoises otters "
-        "birds ornithology reptiles amphibians insects pollinators plants botany trees fungi "
-        "national parks reserves field research tracking telemetry tagging collars diving "
-        "underwater surveys veterinary wildlife animal physiology heart rate metabolism "
-        "migration breeding nesting endangered species rewilding climate nature reserves "
-        "environmental science earth natural world outdoor wilderness zoology ethology"
-    ),
-    "world": (
-        "world international global countries geopolitics diplomacy conflict economy "
-        "policy migration society country tourism travel cities urban rural development "
-        "humanitarian aid trade sanctions elections government law courts crime justice "
-        "culture religion sports Olympics refugees borders United Nations summits"
-    ),
-    "science": (
-        "science research discovery breakthrough scientists discover scientists say stunned study "
-        "findings evidence hypothesis experiment laboratory peer reviewed journal publication preprint "
-        "biology biochemistry molecular biology cell genetics genomics proteomics "
-        "neuroscience brain nervous system neurons circuits synapses spinal cord "
-        "sensory perception pain itch scratching dermatology skin immunology "
-        "physiology pharmacology drug discovery clinical trials biomedicine medicine "
-        "aging senescence rejuvenation longevity organ regeneration liver hepatology "
-        "microbiome gut bacteria intestinal flora metabolic transplant fecal microbiota "
-        "physics chemistry astronomy astrophysics cosmology space "
-        "oceanography marine science ocean circulation Atlantic current overturning circulation "
-        "thermohaline meridional AMOC sea level regional climate teleconnections "
-        "geophysics geology volcanology volcanic eruption ash plume stratosphere "
-        "atmospheric chemistry methane greenhouse gas aerosols ozone "
-        "earth system science climate science paleoclimatology weather modeling "
-        "statistics data science engineering materials nanotechnology robotics "
-        "artificial intelligence machine learning microscopy imaging CRISPR biotechnology innovation STEM"
-    ),
+import numpy as np
+
+# Slugs must match visor TOPIC_FILTERS; values are the `topic=` API values.
+# Several focused sentences per topic work better than one huge bag of words.
+TOPICS: dict[str, list[str]] = {
+    "nature": [
+        "Wild animals wildlife ecology biodiversity conservation and protected habitats.",
+        "Forests wetlands rivers lakes oceans coasts marine life and seabird ecology.",
+        "Marine mammals seals whales dolphins field biology telemetry and wildlife surveys.",
+        "Plants fungi insects pollinators botany zoology ethology and national parks.",
+        "Climate adaptation rewilding nature reserves and outdoor environmental stewardship.",
+    ],
+    "world": [
+        "International news geopolitics diplomacy conflicts borders and global security.",
+        "Countries governments elections policy economy trade sanctions and migration.",
+        "Cities society humanitarian crises refugees United Nations and regional summits.",
+        "Culture sports religion tourism travel justice crime courts and human interest.",
+    ],
+    "science": [
+        "Scientific research discoveries peer-reviewed studies laboratory experiments and data.",
+        "Biology medicine neuroscience physiology genetics immunology and drug discovery.",
+        "Brain circuits neurons sensory systems itch pain skin and neuroscience breakthroughs.",
+        "Climate science ocean circulation atmosphere earth system geophysics and sea level.",
+        "Volcanoes atmospheric chemistry methane ozone aerosols and planetary atmospheres.",
+        "Physics chemistry astronomy space telescopes materials nanotechnology and engineering.",
+        "Microbiome gut bacteria aging liver metabolism biotechnology CRISPR and genomics.",
+        "Statistics machine learning robotics AI microscopy imaging and STEM innovation.",
+    ],
 }
 
 
-def _flatten_encode_output(raw: object) -> list[float]:
-    """Turn SentenceTransformer.encode() output into a 1-D float list (no numpy)."""
-    if hasattr(raw, "tolist"):
-        raw = raw.tolist()
-    if not isinstance(raw, list):
-        raise SystemExit(f"Unexpected encode output type: {type(raw)}")
-    if not raw:
-        return []
-    if isinstance(raw[0], (list, tuple)):
-        if len(raw) != 1:
-            raise SystemExit(f"Expected one embedding row, got {len(raw)}")
-        return [float(x) for x in raw[0]]
-    return [float(x) for x in raw]
-
-
-def _l2_normalize(vec: list[float]) -> list[float]:
-    s = sum(x * x for x in vec)
-    n = math.sqrt(s) if s > 0 else 0.0
+def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(vec))
     if n <= 0:
         return vec
-    return [x / n for x in vec]
+    return vec / n
 
 
 def main() -> None:
@@ -104,15 +84,30 @@ def main() -> None:
     expected = int(os.environ.get("EMBEDDING_DIM", "384"))
 
     payload: dict[str, list[float]] = {}
-    for slug, phrase in TOPICS.items():
-        raw = model.encode(phrase[:5000], show_progress_bar=False)
-        flat = _l2_normalize(_flatten_encode_output(raw))
-        if len(flat) != expected:
-            raise SystemExit(f"{slug}: dim {len(flat)} != {expected}")
+    for slug, phrases in TOPICS.items():
+        texts = [p.strip()[:5000] for p in phrases if p and p.strip()]
+        if not texts:
+            raise SystemExit(f"{slug}: no phrases configured")
+
+        mat = model.encode(
+            texts,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        arr = np.asarray(mat, dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.shape[0] != len(texts):
+            raise SystemExit(f"{slug}: encode rows {arr.shape[0]} != phrases {len(texts)}")
+        if arr.shape[1] != expected:
+            raise SystemExit(f"{slug}: dim {arr.shape[1]} != {expected}")
+
+        centroid = _l2_normalize(arr.mean(axis=0))
+        flat = [float(x) for x in centroid.tolist()]
         payload[slug] = flat
 
     out.write_text(json.dumps(payload, indent=0) + "\n", encoding="utf-8")
-    print(f"Wrote {out} ({len(payload)} topics, dim {expected})")
+    print(f"Wrote {out} ({len(payload)} topics, dim {expected}, multi-phrase centroids)")
 
 
 if __name__ == "__main__":

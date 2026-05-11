@@ -130,11 +130,13 @@ def topic_max_distance() -> float:
     Cosine distance cutoff for topic-filtered search (lower = stricter).
     With normalized vectors, good matches are typically closer to 0.
     """
-    raw = os.getenv("TOPIC_MAX_DISTANCE", "0.72").strip()
+    # Slightly looser default: topic centroids are multi-phrase means; strict 0.72
+    # often hid too many relevant rows after phrase updates.
+    raw = os.getenv("TOPIC_MAX_DISTANCE", "0.82").strip()
     try:
         val = float(raw)
     except ValueError:
-        return 0.72
+        return 0.82
     if val < 0:
         return 0.0
     if val > 2:
