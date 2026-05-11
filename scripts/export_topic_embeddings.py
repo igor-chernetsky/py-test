@@ -30,8 +30,10 @@ TOPICS: dict[str, str] = {
         "geophysics climate science earth system atmospheric science innovation"
     ),
     "family": (
-        "family parenting relationships children education home wellbeing mental health "
-        "public health lifestyle community care"
+        "family parenting parenthood relationships marriage couples children teens newborn "
+        "home household school education childcare caregiving eldercare wellbeing wellness "
+        "mental health public health nutrition fitness lifestyle work life balance "
+        "community social support advice guide tips everyday life"
     ),
 }
 
