@@ -33,16 +33,22 @@ TOPICS: dict[str, str] = {
         "culture religion sports Olympics refugees borders United Nations summits"
     ),
     "science": (
-        "science research discovery breakthrough scientists discover findings evidence "
-        "hypothesis experiment laboratory peer reviewed journal publication preprint "
+        "science research discovery breakthrough scientists discover scientists say stunned study "
+        "findings evidence hypothesis experiment laboratory peer reviewed journal publication preprint "
         "biology biochemistry molecular biology cell genetics genomics proteomics "
         "neuroscience brain nervous system neurons circuits synapses spinal cord "
         "sensory perception pain itch scratching dermatology skin immunology "
         "physiology pharmacology drug discovery clinical trials biomedicine medicine "
-        "physics chemistry astronomy astrophysics cosmology space oceanography "
-        "geophysics earth system atmospheric climate modeling statistics data science "
-        "engineering materials nanotechnology robotics artificial intelligence machine learning "
-        "microscopy imaging CRISPR biotechnology innovation STEM"
+        "aging senescence rejuvenation longevity organ regeneration liver hepatology "
+        "microbiome gut bacteria intestinal flora metabolic transplant fecal microbiota "
+        "physics chemistry astronomy astrophysics cosmology space "
+        "oceanography marine science ocean circulation Atlantic current overturning circulation "
+        "thermohaline meridional AMOC sea level regional climate teleconnections "
+        "geophysics geology volcanology volcanic eruption ash plume stratosphere "
+        "atmospheric chemistry methane greenhouse gas aerosols ozone "
+        "earth system science climate science paleoclimatology weather modeling "
+        "statistics data science engineering materials nanotechnology robotics "
+        "artificial intelligence machine learning microscopy imaging CRISPR biotechnology innovation STEM"
     ),
 }
 
