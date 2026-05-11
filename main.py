@@ -260,7 +260,7 @@ def list_news(
     topic: str | None = Query(
         default=None,
         description=(
-            "Topic slug (nature, world, science, family): rank by pgvector similarity using "
+            "Topic slug (nature, world, science): rank by pgvector similarity using "
             "precomputed embeddings from topic_embeddings.json. Rows need non-null embedding. "
             "Also applies a similarity cutoff so non-relevant rows are excluded."
         ),
@@ -299,7 +299,7 @@ def list_news(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Unknown topic. Use one of: nature, world, science, family "
+                    "Unknown topic. Use one of: nature, world, science "
                     "(or redeploy with matching topic_embeddings.json)."
                 ),
             )

@@ -17,23 +17,27 @@ from pathlib import Path
 # Phrases must match visor TOPIC_FILTERS; slugs are the `topic=` API values.
 TOPICS: dict[str, str] = {
     "nature": (
-        "nature environment wildlife biodiversity conservation ecology forests oceans "
-        "climate adaptation sustainability habitats"
+        "nature wildlife wild animals biodiversity conservation ecology ecosystems habitats "
+        "forests woodlands grasslands wetlands rivers lakes oceans coasts marine shoreline "
+        "marine biology ocean life seals sea lions walruses whales dolphins porpoises otters "
+        "birds ornithology reptiles amphibians insects pollinators plants botany trees fungi "
+        "national parks reserves field research tracking telemetry tagging collars diving "
+        "underwater surveys veterinary wildlife animal physiology heart rate metabolism "
+        "migration breeding nesting endangered species rewilding climate nature reserves "
+        "environmental science earth natural world outdoor wilderness zoology ethology"
     ),
     "world": (
         "world international global countries geopolitics diplomacy conflict economy "
-        "policy migration society"
+        "policy migration society country tourism travel cities urban rural development "
+        "humanitarian aid trade sanctions elections government law courts crime justice "
+        "culture religion sports Olympics refugees borders United Nations summits"
     ),
     "science": (
         "science research discovery scientific study experiment peer reviewed journal "
         "laboratory medicine biology physics chemistry astronomy space oceanography "
-        "geophysics climate science earth system atmospheric science innovation"
-    ),
-    "family": (
-        "family parenting parenthood relationships marriage couples children teens newborn "
-        "home household school education childcare caregiving eldercare wellbeing wellness "
-        "mental health public health nutrition fitness lifestyle work life balance "
-        "community social support advice guide tips everyday life"
+        "geophysics climate science earth system atmospheric science innovation "
+        "genetics neuroscience immunology epidemiology statistics data modeling hypothesis "
+        "engineering materials nanotechnology robotics AI machine learning publication"
     ),
 }
 
