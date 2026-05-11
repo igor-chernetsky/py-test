@@ -3,6 +3,10 @@
 Fetch RSS/Atom feeds, normalize into {"articles": [...]} JSON, upload to S3.
 
 Compatible with normalize_news_from_s3.py expected article shape.
+
+Each article may include ``rss_label`` (short slug, e.g. science, nature) and
+``rss_feed_url``; both are stored inside ``gdelt_snippet`` in PostgreSQL. Filter
+via GET /api/news?rss_label=science on the API.
 """
 
 from __future__ import annotations
@@ -22,18 +26,32 @@ import boto3
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 DEFAULT_TIMEOUT = 30
-DEFAULT_FEEDS = [
-    # Science-heavy feeds
-    "https://www.sciencedaily.com/rss/all.xml",
-    "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-    # Public health
-    "https://www.cdc.gov/media/rss/rss.xml",
-    "https://www.who.int/rss-feeds/news-english.xml",
-    # Culture & film
-    "https://www.theguardian.com/culture/rss",
-    "https://www.theguardian.com/film/rss",
-    "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-]
+# (feed_url, rss_label) — label is stored in gdelt_snippet.rss_label (see normalize_news_from_s3).
+RSS_FEEDS: tuple[tuple[str, str], ...] = (
+    # Science
+    ("https://www.sciencedaily.com/rss/all.xml", "science"),
+    ("https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "science"),
+    ("https://www.theguardian.com/science/rss", "science"),
+    ("https://www.phys.org/rss-feed/", "science"),
+    ("https://www.space.com/feeds/tag/science", "science"),
+    # Nature / environment / climate
+    ("https://www.theguardian.com/environment/rss", "nature"),
+    ("https://www.smithsonianmag.com/rss/science-nature/", "nature"),
+    # Health / society-adjacent (often positive-leaning institutional news)
+    ("https://www.cdc.gov/media/rss/rss.xml", "health"),
+    ("https://www.who.int/rss-feeds/news-english.xml", "health"),
+    # Culture & film & arts
+    ("https://www.theguardian.com/culture/rss", "culture"),
+    ("https://www.theguardian.com/film/rss", "film"),
+    ("https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", "culture"),
+    ("https://www.theguardian.com/artanddesign/rss", "culture"),
+    # World (broader wire; may hit positive_only filter more often)
+    ("https://feeds.bbci.co.uk/news/world/rss.xml", "world"),
+    ("https://www.theguardian.com/world/rss", "world"),
+    # Uplifting / solutions-oriented
+    ("https://www.goodnewsnetwork.org/feed/", "positive"),
+    ("https://www.positive.news/feed/", "positive"),
+)
 
 
 def _iso_to_seendate(value: datetime) -> str:
@@ -135,7 +153,13 @@ def _source_country_from_host(host: str | None) -> str | None:
     return None
 
 
-def parse_feed(xml_bytes: bytes, feed_url: str, *, enrich_images: bool) -> list[dict[str, object]]:
+def parse_feed(
+    xml_bytes: bytes,
+    feed_url: str,
+    rss_label: str,
+    *,
+    enrich_images: bool,
+) -> list[dict[str, object]]:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -183,6 +207,8 @@ def parse_feed(xml_bytes: bytes, feed_url: str, *, enrich_images: bool) -> list[
                 "sourceTitle": feed_title,
                 "issue": None,
                 "feedTitle": feed_title,
+                "rss_label": rss_label.strip().lower(),
+                "rss_feed_url": feed_url,
             }
         )
     return out
@@ -192,7 +218,7 @@ def fetch_url(url: str, timeout: int) -> bytes:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "rss-fetch-to-s3/1.0 (+https://github.com/)",
+            "User-Agent": "rss-fetch-to-s3/1.0 (compatible; +https://github.com/) Mozilla/5.0",
             "Accept": "application/rss+xml, application/atom+xml, text/xml, application/xml, */*",
         },
     )
@@ -217,10 +243,15 @@ def main() -> int:
         "--feed",
         action="append",
         default=[],
-        help="Feed URL (repeatable). If omitted, built-in feed list is used.",
+        help="Feed URL (repeatable). Label defaults to 'custom'. If omitted, built-in RSS_FEEDS is used.",
     )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout seconds")
-    parser.add_argument("--max-per-feed", type=int, default=10, help="Max entries per feed")
+    parser.add_argument(
+        "--max-per-feed",
+        type=int,
+        default=15,
+        help="Max entries per feed (after parse, before global dedupe)",
+    )
     parser.add_argument(
         "--enrich-images",
         action="store_true",
@@ -229,17 +260,21 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Fetch/parse only, do not upload")
     args = parser.parse_args()
 
-    feeds = [f.strip() for f in (args.feed or []) if f.strip()] or DEFAULT_FEEDS
+    if args.feed:
+        feed_jobs = [(f.strip(), "custom") for f in args.feed if f.strip()]
+    else:
+        feed_jobs = list(RSS_FEEDS)
+
     all_articles: list[dict[str, object]] = []
 
-    for feed_url in feeds:
-        print(f"Fetching feed: {feed_url}")
+    for feed_url, rss_label in feed_jobs:
+        print(f"Fetching feed [{rss_label}]: {feed_url}")
         try:
             body = fetch_url(feed_url, args.timeout)
         except Exception as e:
             print(f"Feed fetch failed: {feed_url}: {e}", file=sys.stderr)
             continue
-        parsed = parse_feed(body, feed_url, enrich_images=args.enrich_images)
+        parsed = parse_feed(body, feed_url, rss_label, enrich_images=args.enrich_images)
         if args.max_per_feed > 0:
             parsed = parsed[: args.max_per_feed]
         print(f"Parsed {len(parsed)} items from {feed_url}")

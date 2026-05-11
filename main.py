@@ -145,12 +145,36 @@ def list_news_languages() -> dict[str, list[str]]:
     return {"languages": [row[0] for row in rows]}
 
 
+@api_router.get("/news/rss-labels")
+def list_rss_labels() -> dict[str, list[str]]:
+    """Distinct rss_label values stored by rss_fetch_to_s3 (see gdelt_snippet.rss_label)."""
+    sql = """
+        SELECT DISTINCT BTRIM(gdelt_snippet->>'rss_label') AS label
+        FROM news_articles
+        WHERE gdelt_snippet IS NOT NULL
+          AND COALESCE(BTRIM(gdelt_snippet->>'rss_label'), '') <> ''
+        ORDER BY 1 ASC
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    return {"labels": [row[0] for row in rows if row[0]]}
+
+
 @api_router.get("/news")
 def list_news(
     q: str | None = None,
     domain: str | None = None,
     language: str | None = None,
     source_country: str | None = None,
+    rss_label: str | None = Query(
+        default=None,
+        description=(
+            "Filter rows where gdelt_snippet.rss_label equals this slug (case-insensitive). "
+            "Set by RSS fetcher for ingested feeds; other sources usually have no label."
+        ),
+    ),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     order_by: Literal["created_at", "seen_at"] = Query(
@@ -180,6 +204,9 @@ def list_news(
     if source_country:
         where_parts.append("source_country = %s")
         values.append(source_country)
+    if rss_label and rss_label.strip():
+        where_parts.append("lower(btrim(COALESCE(gdelt_snippet->>'rss_label',''))) = %s")
+        values.append(rss_label.strip().lower())
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
