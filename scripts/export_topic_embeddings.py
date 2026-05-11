@@ -16,10 +16,23 @@ from pathlib import Path
 
 # Phrases must match visor TOPIC_FILTERS; slugs are the `topic=` API values.
 TOPICS: dict[str, str] = {
-    "nature": "nature environment wildlife biodiversity climate earth",
-    "world": "world international global countries diplomacy events",
-    "science": "science research discovery innovation technology space",
-    "family": "family parenting relationships children home wellbeing",
+    "nature": (
+        "nature environment wildlife biodiversity conservation ecology forests oceans "
+        "climate adaptation sustainability habitats"
+    ),
+    "world": (
+        "world international global countries geopolitics diplomacy conflict economy "
+        "policy migration society"
+    ),
+    "science": (
+        "science research discovery scientific study experiment peer reviewed journal "
+        "laboratory medicine biology physics chemistry astronomy space oceanography "
+        "geophysics climate science earth system atmospheric science innovation"
+    ),
+    "family": (
+        "family parenting relationships children education home wellbeing mental health "
+        "public health lifestyle community care"
+    ),
 }
 
 
