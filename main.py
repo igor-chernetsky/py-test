@@ -184,6 +184,14 @@ def list_news(
             "seen_at: source 'seen' time first (when present)."
         ),
     ),
+    mix_within_hour: bool = Query(
+        default=True,
+        description=(
+            "When true, rows are grouped by calendar hour of the sort key, newest hours first; "
+            "within each hour order is a stable pseudo-shuffle (same order for all clients until "
+            "data changes). When false, strict chronological order by order_by then id."
+        ),
+    ),
 ) -> dict[str, object]:
     """
     List normalized news from PostgreSQL with optional filters.
@@ -210,11 +218,22 @@ def list_news(
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
-    order_sql = (
-        "created_at DESC NULLS LAST, id DESC"
-        if order_by == "created_at"
-        else "seen_at DESC NULLS LAST, id DESC"
-    )
+    if mix_within_hour:
+        if order_by == "created_at":
+            bucket_sql = "date_trunc('hour', COALESCE(deduped.created_at, deduped.seen_at))"
+        else:
+            bucket_sql = "date_trunc('hour', COALESCE(deduped.seen_at, deduped.created_at))"
+        order_sql = (
+            f"{bucket_sql} DESC NULLS LAST, "
+            f"md5(COALESCE(deduped.url, '') || '|' || ({bucket_sql})::text) ASC, "
+            f"deduped.id ASC"
+        )
+    else:
+        order_sql = (
+            "created_at DESC NULLS LAST, id DESC"
+            if order_by == "created_at"
+            else "seen_at DESC NULLS LAST, id DESC"
+        )
     # Pick one row per URL (latest by the same sort key) so duplicates never reach the client.
     inner_order_tail = (
         "created_at DESC NULLS LAST, id DESC"
