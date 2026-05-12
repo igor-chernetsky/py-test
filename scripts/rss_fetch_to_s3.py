@@ -26,7 +26,8 @@ import boto3
 DEFAULT_BUCKET = "visorbacket"
 DEFAULT_PREFIX = "gdelt/"
 DEFAULT_TIMEOUT = 30
-# (feed_url, rss_label) — label is stored in gdelt_snippet.rss_label (see normalize_news_from_s3).
+# (feed_url, rss_label) — label stored in gdelt_snippet.rss_label; use "" for feeds that
+# should only appear under "All" (no RSS filter pill), e.g. general good-news sites.
 RSS_FEEDS: tuple[tuple[str, str], ...] = (
     # Science
     ("https://www.sciencedaily.com/rss/all.xml", "science"),
@@ -48,9 +49,9 @@ RSS_FEEDS: tuple[tuple[str, str], ...] = (
     # World (broader wire; may hit positive_only filter more often)
     ("https://feeds.bbci.co.uk/news/world/rss.xml", "world"),
     ("https://www.theguardian.com/world/rss", "world"),
-    # Uplifting / solutions-oriented
-    ("https://www.goodnewsnetwork.org/feed/", "positive"),
-    ("https://www.positive.news/feed/", "positive"),
+    # Good-news sites: no rss_label — whole site is positive; filter pill would be redundant.
+    ("https://www.goodnewsnetwork.org/feed/", ""),
+    ("https://www.positive.news/feed/", ""),
 )
 
 
@@ -191,26 +192,27 @@ def parse_feed(
             summary = _strip_html(summary)[:1200]
         entry_host = urllib.parse.urlparse(link).hostname
         source_country = _source_country_from_host(entry_host or feed_host)
-        out.append(
-            {
-                "url": link,
-                "title": title,
-                "seendate": _iso_to_seendate(datetime.now(timezone.utc)),
-                "domain": entry_host,
-                "language": "English",
-                "sourcecountry": source_country,
-                "socialimage": social_image,
-                "summary": summary,
-                "quote": None,
-                "emotionTag": None,
-                "relevance": None,
-                "sourceTitle": feed_title,
-                "issue": None,
-                "feedTitle": feed_title,
-                "rss_label": rss_label.strip().lower(),
-                "rss_feed_url": feed_url,
-            }
-        )
+        tag = rss_label.strip().lower()
+        article: dict[str, object] = {
+            "url": link,
+            "title": title,
+            "seendate": _iso_to_seendate(datetime.now(timezone.utc)),
+            "domain": entry_host,
+            "language": "English",
+            "sourcecountry": source_country,
+            "socialimage": social_image,
+            "summary": summary,
+            "quote": None,
+            "emotionTag": None,
+            "relevance": None,
+            "sourceTitle": feed_title,
+            "issue": None,
+            "feedTitle": feed_title,
+        }
+        if tag:
+            article["rss_label"] = tag
+            article["rss_feed_url"] = feed_url
+        out.append(article)
     return out
 
 
@@ -268,7 +270,8 @@ def main() -> int:
     all_articles: list[dict[str, object]] = []
 
     for feed_url, rss_label in feed_jobs:
-        print(f"Fetching feed [{rss_label}]: {feed_url}")
+        label_log = rss_label if rss_label.strip() else "(no label)"
+        print(f"Fetching feed [{label_log}]: {feed_url}")
         try:
             body = fetch_url(feed_url, args.timeout)
         except Exception as e:
