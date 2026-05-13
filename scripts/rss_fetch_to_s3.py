@@ -49,6 +49,9 @@ RSS_FEEDS: tuple[tuple[str, str], ...] = (
     # World (broader wire; may hit positive_only filter more often)
     ("https://feeds.bbci.co.uk/news/world/rss.xml", "world"),
     ("https://www.theguardian.com/world/rss", "world"),
+    # Sport
+    ("https://feeds.bbci.co.uk/sport/rss.xml", "sport"),
+    ("https://www.theguardian.com/uk/sport/rss", "sport"),
     # Good-news sites: no rss_label — whole site is positive; filter pill would be redundant.
     ("https://www.goodnewsnetwork.org/feed/", ""),
     ("https://www.positive.news/feed/", ""),
